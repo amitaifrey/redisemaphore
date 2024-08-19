@@ -60,7 +60,7 @@ func WithQueueKeysByPrio(queueKeysByPrio ...string) Option {
 }
 
 type semaphore struct {
-	redisClient     *redis.Client
+	redisClient     redis.UniversalClient
 	mutex           *redsync.Mutex
 	name            string
 	size            int
@@ -71,7 +71,7 @@ type semaphore struct {
 	queueKeysByPrio []string
 }
 
-func NewSemaphore(redisClient *redis.Client, name string, size int, opts ...Option) (Semaphore, error) {
+func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts ...Option) (Semaphore, error) {
 	s := &semaphore{
 		redisClient:     redisClient,
 		name:            name,
