@@ -48,7 +48,7 @@ func TestSemaphore_Acquire(t *testing.T) {
 	defer cancel()
 
 	// Test acquiring a key
-	err = semaphore.Acquire(ctx, "semaphore-queue", "key1")
+	err = semaphore.Acquire(ctx, "key1")
 	require.NoError(t, err)
 
 	// Check that the key was removed from the queue
@@ -62,7 +62,7 @@ func TestSemaphore_Acquire(t *testing.T) {
 	require.Equal(t, int64(0), intCmd.Val())
 
 	// cleanup
-	err = semaphore.Release(ctx, "semaphore-queue", "key1")
+	err = semaphore.Release(ctx, "key1")
 	require.NoError(t, err)
 
 	// Check if the key exists in the semaphore set
@@ -89,16 +89,16 @@ func TestSemaphore_AcquireOrder(t *testing.T) {
 	defer cancel()
 
 	acquireAndRelease := func(queue, key string, c chan string) {
-		err := semaphore.Acquire(ctx, queue, key)
+		err := semaphore.AcquireQueue(ctx, queue, key)
 		require.NoError(t, err)
 		c <- key
 
-		err = semaphore.Release(ctx, queue, key)
+		err = semaphore.ReleaseQueue(ctx, queue, key)
 		require.NoError(t, err)
 	}
 
 	// acquire so the semaphore won't start
-	err = semaphore.Acquire(ctx, "queue1", "init")
+	err = semaphore.AcquireQueue(ctx, "queue1", "init")
 	require.NoError(t, err)
 
 	// Initialize channels and keys
@@ -132,7 +132,7 @@ func TestSemaphore_AcquireOrder(t *testing.T) {
 	}
 
 	// release the init key
-	err = semaphore.Release(ctx, "queue1", "init")
+	err = semaphore.ReleaseQueue(ctx, "queue1", "init")
 	require.NoError(t, err)
 
 	keys := make([]string, 9)
@@ -167,12 +167,12 @@ func TestSemaphore_Concurrent(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		go func() {
 			k := uuid.NewString()
-			err := semaphore.Acquire(ctx, "queue1", k)
+			err := semaphore.AcquireQueue(ctx, "queue1", k)
 			require.NoError(t, err)
 			c <- "before"
 			time.Sleep(time.Second * 10)
 
-			err = semaphore.Release(ctx, "queue1", k)
+			err = semaphore.ReleaseQueue(ctx, "queue1", k)
 			require.NoError(t, err)
 			c <- "after"
 		}()

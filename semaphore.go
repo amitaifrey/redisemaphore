@@ -13,8 +13,10 @@ import (
 )
 
 type Semaphore interface {
-	Acquire(ctx context.Context, queue, key string) error
-	Release(ctx context.Context, queue, key string) error
+	Acquire(ctx context.Context, key string) error
+	Release(ctx context.Context, key string) error
+	AcquireQueue(ctx context.Context, queue, key string) error
+	ReleaseQueue(ctx context.Context, queue, key string) error
 }
 
 type Option interface {
@@ -93,7 +95,14 @@ func NewSemaphore(redisClient *redis.Client, name string, size int, opts ...Opti
 	return s, nil
 }
 
-func (this *semaphore) Acquire(ctx context.Context, queue, key string) error {
+func (this *semaphore) Acquire(ctx context.Context, key string) error {
+	if len(this.queueKeysByPrio) != 1 {
+		return fmt.Errorf("queue keys by prio must have exactly one element")
+	}
+	return this.AcquireQueue(ctx, this.queueKeysByPrio[0], key)
+}
+
+func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) error {
 	if !slices.Contains(this.queueKeysByPrio, queue) {
 		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
 	}
@@ -135,15 +144,6 @@ func (this *semaphore) Acquire(ctx context.Context, queue, key string) error {
 	}
 
 	return nil
-}
-
-func (this *semaphore) Release(ctx context.Context, queue, key string) error {
-	// non-existing members are ignored, so if this was cleaned up this won't return an error
-	err := this.redisClient.ZRem(ctx, this.name, key).Err()
-	if err == nil || err == redis.Nil {
-		return nil
-	}
-	return errors.WrapPrefix(err, "failed to remove key", 0)
 }
 
 func (this *semaphore) tryInsertNext(ctx context.Context) error {
@@ -217,4 +217,20 @@ func (this *semaphore) insertNext(ctx context.Context, queue, key string) error 
 		return errors.WrapPrefix(r3.Err(), "failed to remove key", 0)
 	}
 	return nil
+}
+
+func (this *semaphore) Release(ctx context.Context, key string) error {
+	if len(this.queueKeysByPrio) != 1 {
+		return fmt.Errorf("queue keys by prio must have exactly one element")
+	}
+	return this.ReleaseQueue(ctx, this.queueKeysByPrio[0], key)
+}
+
+func (this *semaphore) ReleaseQueue(ctx context.Context, queue, key string) error {
+	// non-existing members are ignored, so if this was cleaned up this won't return an error
+	err := this.redisClient.ZRem(ctx, this.name, key).Err()
+	if err == nil || err == redis.Nil {
+		return nil
+	}
+	return errors.WrapPrefix(err, "failed to remove key", 0)
 }
