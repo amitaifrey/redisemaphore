@@ -25,14 +25,9 @@ func TestNewSemaphore(t *testing.T) {
 	})
 
 	// Test with valid inputs
-	semaphore, err := redisemaphore.NewSemaphore(client, "mutex-key", "semaphore-key", 3, time.Minute, time.Minute, time.Second, "queue1")
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 3)
 	assert.NoError(t, err)
 	assert.NotNil(t, semaphore)
-
-	// Test with no queueKeysByPrio
-	semaphore, err = redisemaphore.NewSemaphore(client, "mutex-key", "semaphore-key", 3, time.Minute, time.Minute, time.Second)
-	assert.Error(t, err)
-	assert.Nil(t, semaphore)
 }
 
 func TestSemaphore_Acquire(t *testing.T) {
@@ -46,32 +41,32 @@ func TestSemaphore_Acquire(t *testing.T) {
 		Addr: mr.Addr(),
 	})
 
-	semaphore, err := redisemaphore.NewSemaphore(client, "mutex-key", "semaphore-key", 3, time.Minute, time.Minute, time.Second, "queue1")
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 3)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Test acquiring a key
-	err = semaphore.Acquire(ctx, "queue1", "key1")
+	err = semaphore.Acquire(ctx, "semaphore-queue", "key1")
 	require.NoError(t, err)
 
 	// Check that the key was removed from the queue
-	intCmd := client.ZCard(ctx, "queue1")
+	intCmd := client.ZCard(ctx, "semaphore-queue")
 	require.NoError(t, intCmd.Err())
 	require.Equal(t, int64(0), intCmd.Val())
 
-	// Check if the key exists in the semaphore ordered set
-	intCmd = client.ZRank(ctx, "semaphore-key", "key1")
+	// Check if the key exists in the semaphore set
+	intCmd = client.ZRank(ctx, "semaphore", "key1")
 	require.NoError(t, intCmd.Err())
 	require.Equal(t, int64(0), intCmd.Val())
 
 	// cleanup
-	err = semaphore.Release(ctx, "queue1", "key1")
+	err = semaphore.Release(ctx, "semaphore-queue", "key1")
 	require.NoError(t, err)
 
-	// Check if the key exists in the semaphore hash
-	intCmd = client.ZCard(ctx, "semaphore-key")
+	// Check if the key exists in the semaphore set
+	intCmd = client.ZCard(ctx, "semaphore")
 	require.NoError(t, intCmd.Err())
 	assert.Equal(t, int64(0), intCmd.Val())
 }
@@ -87,7 +82,7 @@ func TestSemaphore_AcquireOrder(t *testing.T) {
 		Addr: mr.Addr(),
 	})
 
-	semaphore, err := redisemaphore.NewSemaphore(client, "mutex-key", "semaphore-key", 1, time.Minute, time.Minute, time.Millisecond*500, "queue1", "queue2", "queue3")
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1, redisemaphore.WithQueueKeysByPrio("queue1", "queue2", "queue3"))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -161,7 +156,7 @@ func TestSemaphore_Concurrent(t *testing.T) {
 		Addr: mr.Addr(),
 	})
 
-	semaphore, err := redisemaphore.NewSemaphore(client, "mutex-key", "semaphore-key", 100, time.Minute, time.Minute, time.Millisecond*100, "queue1", "queue2", "queue3")
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 100, redisemaphore.WithQueueKeysByPrio("queue1", "queue2", "queue3"))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -3,6 +3,7 @@ package redisemaphore
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/go-errors/errors"
@@ -16,37 +17,87 @@ type Semaphore interface {
 	Release(ctx context.Context, queue, key string) error
 }
 
+type Option interface {
+	Apply(*semaphore)
+}
+
+type OptionFunc func(*semaphore)
+
+func (f OptionFunc) Apply(s *semaphore) {
+	f(s)
+}
+
+func WithMutexName(mutexName string) Option {
+	return OptionFunc(func(s *semaphore) {
+		s.mutexName = mutexName
+	})
+}
+
+func WithMutexExpiry(mutexExpiry time.Duration) Option {
+	return OptionFunc(func(s *semaphore) {
+		s.mutexExpiry = mutexExpiry
+	})
+}
+
+func WithDeleteTimeout(deleteTimeout time.Duration) Option {
+	return OptionFunc(func(s *semaphore) {
+		s.deleteTimeout = deleteTimeout
+	})
+}
+
+func WithPollDur(pollDur time.Duration) Option {
+	return OptionFunc(func(s *semaphore) {
+		s.pollDur = pollDur
+	})
+}
+
+func WithQueueKeysByPrio(queueKeysByPrio ...string) Option {
+	return OptionFunc(func(s *semaphore) {
+		s.queueKeysByPrio = queueKeysByPrio
+	})
+}
+
 type semaphore struct {
 	redisClient     *redis.Client
 	mutex           *redsync.Mutex
-	semaphoreKey    string
+	name            string
 	size            int
+	mutexExpiry     time.Duration
+	mutexName       string
 	deleteTimeout   time.Duration
 	pollDur         time.Duration
 	queueKeysByPrio []string
 }
 
-func NewSemaphore(redisClient *redis.Client, mutexKey, semaphoreKey string, size int, mutexExpiry, deleteTimeout, pollDur time.Duration, queueKeysByPrio ...string) (Semaphore, error) {
-	if len(queueKeysByPrio) == 0 {
-		return nil, errors.New("queueKeysByPrio must be of length at least 1")
+func NewSemaphore(redisClient *redis.Client, name string, size int, opts ...Option) (Semaphore, error) {
+	s := &semaphore{
+		redisClient:     redisClient,
+		name:            name,
+		size:            size,
+		mutexExpiry:     10 * time.Second,
+		mutexName:       fmt.Sprintf("%s-mutex", name),
+		deleteTimeout:   10 * time.Minute,
+		pollDur:         100 * time.Millisecond,
+		queueKeysByPrio: []string{fmt.Sprintf("%s-queue", name)},
+	}
+
+	for _, o := range opts {
+		o.Apply(s)
 	}
 
 	pool := goredis.NewPool(redisClient)
 	rs := redsync.New(pool)
-	mutex := rs.NewMutex(mutexKey, redsync.WithExpiry(mutexExpiry))
+	mutex := rs.NewMutex(s.mutexName, redsync.WithExpiry(s.mutexExpiry))
+	s.mutex = mutex
 
-	return &semaphore{
-		redisClient:     redisClient,
-		mutex:           mutex,
-		semaphoreKey:    semaphoreKey,
-		size:            size,
-		deleteTimeout:   deleteTimeout,
-		pollDur:         pollDur,
-		queueKeysByPrio: queueKeysByPrio,
-	}, nil
+	return s, nil
 }
 
 func (this *semaphore) Acquire(ctx context.Context, queue, key string) error {
+	if !slices.Contains(this.queueKeysByPrio, queue) {
+		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
+	}
+
 	for {
 		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
 			NX: true, // do not override score
@@ -57,7 +108,7 @@ func (this *semaphore) Acquire(ctx context.Context, queue, key string) error {
 			return errors.WrapPrefix(addCmd.Err(), "failed to push key", 0)
 		}
 
-		semaphoreExists := this.redisClient.ZRank(ctx, this.semaphoreKey, key)
+		semaphoreExists := this.redisClient.ZRank(ctx, this.name, key)
 		if semaphoreExists.Err() == nil {
 			break
 		}
@@ -88,7 +139,7 @@ func (this *semaphore) Acquire(ctx context.Context, queue, key string) error {
 
 func (this *semaphore) Release(ctx context.Context, queue, key string) error {
 	// non-existing members are ignored, so if this was cleaned up this won't return an error
-	err := this.redisClient.ZRem(ctx, this.semaphoreKey, key).Err()
+	err := this.redisClient.ZRem(ctx, this.name, key).Err()
 	if err == nil || err == redis.Nil {
 		return nil
 	}
@@ -143,7 +194,7 @@ func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
 }
 
 func (this *semaphore) hasRoom(ctx context.Context) (bool, error) {
-	zcard := this.redisClient.ZCard(ctx, this.semaphoreKey)
+	zcard := this.redisClient.ZCard(ctx, this.name)
 	if zcard.Err() != nil {
 		return false, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
 	}
@@ -151,12 +202,12 @@ func (this *semaphore) hasRoom(ctx context.Context) (bool, error) {
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.semaphoreKey, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
+	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
 	}
 
-	r2 := this.redisClient.ZAdd(ctx, this.semaphoreKey, redis.Z{Score: float64(time.Now().UnixNano()), Member: key})
+	r2 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixNano()), Member: key})
 	if r2.Err() != nil {
 		return errors.WrapPrefix(r2.Err(), "failed to add key", 0)
 	}
