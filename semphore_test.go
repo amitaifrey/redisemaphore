@@ -170,7 +170,7 @@ func TestSemaphore_Concurrent(t *testing.T) {
 			err := semaphore.AcquireQueue(ctx, "queue1", k)
 			require.NoError(t, err)
 			c <- "before"
-			time.Sleep(time.Second * 10)
+			time.Sleep(time.Second * 5)
 
 			err = semaphore.ReleaseQueue(ctx, "queue1", k)
 			require.NoError(t, err)

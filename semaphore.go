@@ -12,6 +12,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var ErrNoKeysLeft = errors.New("error: no keys left in queues")
+
 type Semaphore interface {
 	Acquire(ctx context.Context, key string) error
 	Release(ctx context.Context, key string) error
@@ -158,17 +160,29 @@ func (this *semaphore) tryInsertNext(ctx context.Context) error {
 	}
 	defer this.mutex.UnlockContext(ctx)
 
-	hasRoom, err := this.hasRoom(ctx)
-	if err != nil || !hasRoom { // if there is no room err is nil so we can just return it
+	toAdd, err := this.amountToAdd(ctx)
+	if err != nil || toAdd <= 0 { // if there is no room err is nil so we can just return it
 		return err
 	}
 
-	nextQueue, nextKey, err := this.getNextKey(ctx)
-	if err != nil {
-		return errors.WrapPrefix(err, "failed to get next key", 0)
+	for toAdd > 0 {
+		nextQueue, nextKey, err := this.getNextKey(ctx)
+		if err == ErrNoKeysLeft {
+			return nil
+		}
+		if err != nil {
+			return errors.WrapPrefix(err, "failed to get next key", 0)
+		}
+
+		err = this.insertNext(ctx, nextQueue, nextKey)
+		if err != nil {
+			return errors.WrapPrefix(err, "failed to insert next key", 0)
+		}
+
+		toAdd--
 	}
 
-	return this.insertNext(ctx, nextQueue, nextKey)
+	return nil
 }
 
 func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
@@ -190,15 +204,15 @@ func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
 		}
 	}
 
-	return "", "", fmt.Errorf("no keys found")
+	return "", "", ErrNoKeysLeft
 }
 
-func (this *semaphore) hasRoom(ctx context.Context) (bool, error) {
+func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
 	zcard := this.redisClient.ZCard(ctx, this.name)
 	if zcard.Err() != nil {
-		return false, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
+		return -1, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
 	}
-	return zcard.Val() < int64(this.size), nil
+	return this.size - int(zcard.Val()), nil
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
