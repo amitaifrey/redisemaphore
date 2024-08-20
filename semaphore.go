@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/go-errors/errors"
-	"github.com/go-redsync/redsync/v4"
-	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -21,65 +19,73 @@ type Semaphore interface {
 	ReleaseQueue(ctx context.Context, queue, key string) error
 }
 
-type Option interface {
+type SemaphoreOption interface {
 	Apply(*semaphore)
 }
 
-type OptionFunc func(*semaphore)
+type SemaphoreOptionFunc func(*semaphore)
 
-func (f OptionFunc) Apply(s *semaphore) {
+func (f SemaphoreOptionFunc) Apply(s *semaphore) {
 	f(s)
 }
 
-func WithMutexName(mutexName string) Option {
-	return OptionFunc(func(s *semaphore) {
+func WithSemaphoreMutexName(mutexName string) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
 		s.mutexName = mutexName
 	})
 }
 
-func WithMutexExpiry(mutexExpiry time.Duration) Option {
-	return OptionFunc(func(s *semaphore) {
+func WithSemaphoreMutexExpiry(mutexExpiry time.Duration) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
 		s.mutexExpiry = mutexExpiry
 	})
 }
 
-func WithDeleteTimeout(deleteTimeout time.Duration) Option {
-	return OptionFunc(func(s *semaphore) {
+func WithSemaphoreMutexTimeout(mutexTimeout time.Duration) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
+		s.mutexTimeout = mutexTimeout
+	})
+}
+
+func WithSemaphoreDeleteTimeout(deleteTimeout time.Duration) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
 		s.deleteTimeout = deleteTimeout
 	})
 }
 
-func WithPollDur(pollDur time.Duration) Option {
-	return OptionFunc(func(s *semaphore) {
+func WithSemaphorePollDur(pollDur time.Duration) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
 		s.pollDur = pollDur
 	})
 }
 
-func WithQueueKeysByPrio(queueKeysByPrio ...string) Option {
-	return OptionFunc(func(s *semaphore) {
+func WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *semaphore) {
 		s.queueKeysByPrio = queueKeysByPrio
 	})
 }
 
 type semaphore struct {
 	redisClient     redis.UniversalClient
-	mutex           *redsync.Mutex
+	mutex           Mutex
 	name            string
 	size            int
-	mutexExpiry     time.Duration
 	mutexName       string
+	mutexExpiry     time.Duration
+	mutexTimeout    time.Duration
 	deleteTimeout   time.Duration
 	pollDur         time.Duration
 	queueKeysByPrio []string
 }
 
-func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts ...Option) (Semaphore, error) {
+func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts ...SemaphoreOption) (Semaphore, error) {
 	s := &semaphore{
 		redisClient:     redisClient,
 		name:            name,
 		size:            size,
-		mutexExpiry:     10 * time.Second,
 		mutexName:       fmt.Sprintf("%s-mutex", name),
+		mutexExpiry:     1 * time.Minute,
+		mutexTimeout:    10 * time.Minute,
 		deleteTimeout:   10 * time.Minute,
 		pollDur:         100 * time.Millisecond,
 		queueKeysByPrio: []string{fmt.Sprintf("%s-queue", name)},
@@ -89,10 +95,7 @@ func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts
 		o.Apply(s)
 	}
 
-	pool := goredis.NewPool(redisClient)
-	rs := redsync.New(pool)
-	mutex := rs.NewMutex(s.mutexName, redsync.WithExpiry(s.mutexExpiry))
-	s.mutex = mutex
+	s.mutex = NewMutex(redisClient, s.mutexName, WithMutexExpiry(s.mutexExpiry), WithMutexTimeout(s.mutexTimeout), WithMutexPollDur(s.pollDur))
 
 	return s, nil
 }
@@ -149,16 +152,11 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) erro
 }
 
 func (this *semaphore) tryInsertNext(ctx context.Context) error {
-	err := this.mutex.TryLockContext(ctx)
+	err := this.mutex.Acquire(ctx)
 	if err != nil {
-		switch err.(type) {
-		case *redsync.ErrTaken, *redsync.ErrNodeTaken:
-			return nil
-		default:
-			return errors.WrapPrefix(err, "failed to acquire lock", 0)
-		}
+		return errors.WrapPrefix(err, "failed to acquire mutex", 0)
 	}
-	defer this.mutex.UnlockContext(ctx)
+	defer this.mutex.Release(ctx)
 
 	toAdd, err := this.amountToAdd(ctx)
 	if err != nil || toAdd <= 0 { // if there is no room err is nil so we can just return it

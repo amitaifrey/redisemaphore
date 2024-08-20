@@ -5,24 +5,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/amitaifrey/redisemaphore"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestNewSemaphore(t *testing.T) {
-	// Start a mock Redis server
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
+	mr, client := setupRedis(t)
 	defer mr.Close()
-
-	// Connect to the mock Redis server
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
 
 	// Test with valid inputs
 	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 3)
@@ -31,15 +22,8 @@ func TestNewSemaphore(t *testing.T) {
 }
 
 func TestSemaphore_Acquire(t *testing.T) {
-	// Start a mock Redis server
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
+	mr, client := setupRedis(t)
 	defer mr.Close()
-
-	// Connect to the mock Redis server
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
 
 	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 3)
 	require.NoError(t, err)
@@ -72,17 +56,10 @@ func TestSemaphore_Acquire(t *testing.T) {
 }
 
 func TestSemaphore_AcquireOrder(t *testing.T) {
-	// Start a mock Redis server
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
+	mr, client := setupRedis(t)
 	defer mr.Close()
 
-	// Connect to the mock Redis server
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-
-	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1, redisemaphore.WithQueueKeysByPrio("queue1", "queue2", "queue3"))
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1, redisemaphore.WithSemaphoreQueueKeysByPrio("queue1", "queue2", "queue3"))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -146,17 +123,10 @@ func TestSemaphore_AcquireOrder(t *testing.T) {
 }
 
 func TestSemaphore_Concurrent(t *testing.T) {
-	// Start a mock Redis server
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
+	mr, client := setupRedis(t)
 	defer mr.Close()
 
-	// Connect to the mock Redis server
-	client := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-
-	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 100, redisemaphore.WithQueueKeysByPrio("queue1", "queue2", "queue3"))
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 100, redisemaphore.WithSemaphoreQueueKeysByPrio("queue1", "queue2", "queue3"))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
