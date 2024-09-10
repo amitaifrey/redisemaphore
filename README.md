@@ -1,4 +1,4 @@
-# Redis-Based Distributed Semaphore Implementation, With Priority Queues
+# Redis-Based Semaphore Implementation, Optional Distribution and Priority Queues
 
 This repository contains a Go implementation of a Redis-based semaphore mechanism that allows for distributed locking using Redis sorted sets. It also includes a mutex lock mechanism to ensure safe concurrent access. The distribution of the semaphore is based redis clusters, i.e. we rely on the correctness of the Redis cluster to ensure the semaphore's correctness.
 
