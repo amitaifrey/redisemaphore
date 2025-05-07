@@ -158,3 +158,40 @@ func TestSemaphore_Concurrent(t *testing.T) {
 		require.Equal(t, "after", out)
 	}
 }
+
+func TestSemaphore_KeyExpiration(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	// Create a semaphore with a short delete timeout
+	deleteTimeout := 2 * time.Second
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1, redisemaphore.WithSemaphoreDeleteTimeout(deleteTimeout))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Acquire the semaphore with key1
+	key1 := "key1"
+	err = semaphore.Acquire(ctx, key1)
+	require.NoError(t, err)
+
+	// Verify key1 is in the semaphore set
+	intCmd := client.ZRank(ctx, "semaphore", key1)
+	require.NoError(t, intCmd.Err())
+	require.Equal(t, int64(0), intCmd.Val())
+
+	// Try to acquire with key2 - should be successful after key1 expires
+	key2 := "key2"
+	err = semaphore.Acquire(ctx, key2)
+	require.NoError(t, err)
+
+	// Verify key2 is in the semaphore set
+	intCmd = client.ZRank(ctx, "semaphore", key2)
+	require.NoError(t, intCmd.Err())
+	require.Equal(t, int64(0), intCmd.Val())
+
+	// Cleanup
+	err = semaphore.Release(ctx, key2)
+	require.NoError(t, err)
+}
