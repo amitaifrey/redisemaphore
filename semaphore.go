@@ -206,6 +206,11 @@ func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
 }
 
 func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
+	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
+	if r1.Err() != nil {
+		return -1, errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
+	}
+
 	zcard := this.redisClient.ZCard(ctx, this.name)
 	if zcard.Err() != nil {
 		return -1, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
@@ -214,19 +219,14 @@ func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
+	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixNano()), Member: key})
 	if r1.Err() != nil {
-		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
+		return errors.WrapPrefix(r1.Err(), "failed to add key", 0)
 	}
 
-	r2 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixNano()), Member: key})
-	if r2.Err() != nil {
-		return errors.WrapPrefix(r2.Err(), "failed to add key", 0)
-	}
-
-	r3 := this.redisClient.ZRem(ctx, queue, key)
-	if r3.Err() != nil && r3.Err() != redis.Nil {
-		return errors.WrapPrefix(r3.Err(), "failed to remove key", 0)
+	r2 := this.redisClient.ZRem(ctx, queue, key)
+	if r2.Err() != nil && r2.Err() != redis.Nil {
+		return errors.WrapPrefix(r2.Err(), "failed to remove key", 0)
 	}
 	return nil
 }
