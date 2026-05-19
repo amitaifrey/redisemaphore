@@ -127,10 +127,10 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 		}
 	}()
 
-	registered, err = this.registerWaiter(ctx, queue, key)
-	if err != nil {
+	if err = this.registerWaiter(ctx, queue, key); err != nil {
 		return err
 	}
+	registered = true
 
 	for {
 		exists, err := this.keyExists(ctx, this.name, key)
@@ -157,12 +157,34 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 
 func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) error {
 	return this.withMutex(ctx, this.mutexTokenDescription("fill", queue, key), func(ctx context.Context) error {
-		return this.fillAvailable(ctx)
+		toAdd, err := this.amountToAdd(ctx)
+		if err != nil || toAdd <= 0 {
+			return err
+		}
+
+		for toAdd > 0 {
+			nextQueue, nextKey, err := this.getNextKey(ctx)
+			if err == ErrNoKeysLeft {
+				return nil
+			}
+			if err != nil {
+				return errors.WrapPrefix(err, "failed to get next key", 0)
+			}
+
+			err = this.insertNext(ctx, nextQueue, nextKey)
+			if err != nil {
+				return errors.WrapPrefix(err, "failed to insert next key", 0)
+			}
+
+			toAdd--
+		}
+
+		return nil
 	})
 }
 
-func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (registered bool, err error) {
-	err = this.withMutex(ctx, this.mutexTokenDescription("register", queue, key), func(ctx context.Context) error {
+func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) error {
+	return this.withMutex(ctx, this.mutexTokenDescription("register", queue, key), func(ctx context.Context) error {
 		if err := this.cleanupExpiredHolders(ctx); err != nil {
 			return err
 		}
@@ -188,7 +210,7 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (r
 		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
 			NX: true,
 			Members: []redis.Z{
-				{Score: this.waiterScore(), Member: key},
+				{Score: float64(time.Now().UnixMicro()), Member: key},
 			},
 		})
 		if addCmd.Err() != nil && addCmd.Err() != redis.Nil {
@@ -198,10 +220,8 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (r
 			return ErrDuplicateKey
 		}
 
-		registered = true
-		return this.fillAvailable(ctx)
+		return nil
 	})
-	return registered, err
 }
 
 func (this *semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
@@ -222,32 +242,6 @@ func (this *semaphore) withMutex(ctx context.Context, tokenDescription string, f
 	}()
 
 	return fn(ctx)
-}
-
-func (this *semaphore) fillAvailable(ctx context.Context) error {
-	toAdd, err := this.amountToAdd(ctx)
-	if err != nil || toAdd <= 0 { // if there is no room err is nil so we can just return it
-		return err
-	}
-
-	for toAdd > 0 {
-		nextQueue, nextKey, err := this.getNextKey(ctx)
-		if err == ErrNoKeysLeft {
-			return nil
-		}
-		if err != nil {
-			return errors.WrapPrefix(err, "failed to get next key", 0)
-		}
-
-		err = this.insertNext(ctx, nextQueue, nextKey)
-		if err != nil {
-			return errors.WrapPrefix(err, "failed to insert next key", 0)
-		}
-
-		toAdd--
-	}
-
-	return nil
 }
 
 func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
@@ -285,7 +279,8 @@ func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
 }
 
 func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", this.expiredHolderScore())
+	cutoff := fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixMicro())
+	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", cutoff)
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
 	}
@@ -294,20 +289,16 @@ func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
 
 func (this *semaphore) cleanupWaiter(ctx context.Context, key string) error {
 	return this.withMutex(ctx, this.mutexTokenDescription("cleanup-waiter", "", key), func(ctx context.Context) error {
-		return this.cleanupWaiterLocked(ctx, key)
-	})
-}
-
-func (this *semaphore) cleanupWaiterLocked(ctx context.Context, key string) error {
-	for _, queue := range this.queueKeysByPrio {
-		if err := this.redisClient.ZRem(ctx, queue, key).Err(); err != nil && err != redis.Nil {
-			return errors.WrapPrefix(err, "failed to remove key from queue", 0)
+		for _, queue := range this.queueKeysByPrio {
+			if err := this.redisClient.ZRem(ctx, queue, key).Err(); err != nil && err != redis.Nil {
+				return errors.WrapPrefix(err, "failed to remove key from queue", 0)
+			}
 		}
-	}
-	if err := this.redisClient.ZRem(ctx, this.name, key).Err(); err != nil && err != redis.Nil {
-		return errors.WrapPrefix(err, "failed to remove key from semaphore", 0)
-	}
-	return nil
+		if err := this.redisClient.ZRem(ctx, this.name, key).Err(); err != nil && err != redis.Nil {
+			return errors.WrapPrefix(err, "failed to remove key from semaphore", 0)
+		}
+		return nil
+	})
 }
 
 func (this *semaphore) keyExists(ctx context.Context, set, key string) (bool, error) {
@@ -332,7 +323,7 @@ func (this *semaphore) mutexTokenDescription(action, queue, key string) string {
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
-	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: this.holderScore(), Member: key})
+	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixMicro()), Member: key})
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to add key", 0)
 	}
@@ -342,18 +333,6 @@ func (this *semaphore) insertNext(ctx context.Context, queue, key string) error 
 		return errors.WrapPrefix(r2.Err(), "failed to remove key", 0)
 	}
 	return nil
-}
-
-func (this *semaphore) holderScore() float64 {
-	return float64(time.Now().UnixMicro())
-}
-
-func (this *semaphore) waiterScore() float64 {
-	return float64(time.Now().UnixMicro())
-}
-
-func (this *semaphore) expiredHolderScore() string {
-	return fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixMicro())
 }
 
 func (this *semaphore) Release(ctx context.Context, key string) error {
