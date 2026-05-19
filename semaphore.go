@@ -144,7 +144,7 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 			return nil
 		}
 
-		if err := this.tryInsertNext(ctx); err != nil {
+		if err := this.tryInsertNext(ctx, queue, key); err != nil {
 			return err
 		}
 
@@ -157,8 +157,8 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 	}
 }
 
-func (this *semaphore) tryInsertNext(ctx context.Context) error {
-	return this.withMutex(ctx, this.mutexTokenDescription("fill", "", ""), func(ctx context.Context) error {
+func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) error {
+	return this.withMutex(ctx, this.mutexTokenDescription("fill", queue, key), func(ctx context.Context) error {
 		return this.fillAvailable(ctx)
 	})
 }
