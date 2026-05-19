@@ -66,7 +66,6 @@ type mutex struct {
 	// token. Serialize acquire/release lifecycles locally so a later acquire
 	// cannot overwrite that token before an earlier release uses it.
 	localLock chan struct{}
-	releaseMu sync.Mutex
 	stateMu   sync.Mutex
 	token     string
 }
@@ -152,22 +151,18 @@ func (this *mutex) acquireWithToken(ctx context.Context, token string) error {
 }
 
 func (this *mutex) Release(ctx context.Context) error {
-	this.releaseMu.Lock()
-	defer this.releaseMu.Unlock()
-
 	this.stateMu.Lock()
 	token := this.token
 	if token == "" {
 		this.stateMu.Unlock()
 		return nil
 	}
-	this.stateMu.Unlock()
 
 	if err := releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err(); err != nil {
+		this.stateMu.Unlock()
 		return err
 	}
 
-	this.stateMu.Lock()
 	this.token = ""
 	this.stateMu.Unlock()
 
