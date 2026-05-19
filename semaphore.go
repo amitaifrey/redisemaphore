@@ -292,7 +292,7 @@ func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
 }
 
 func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
+	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", this.expiredHolderScore())
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
 	}
@@ -339,7 +339,7 @@ func (this *semaphore) mutexTokenDescription(action, queue, key string) string {
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
-	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixNano()), Member: key})
+	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: this.holderScore(), Member: key})
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to add key", 0)
 	}
@@ -349,6 +349,14 @@ func (this *semaphore) insertNext(ctx context.Context, queue, key string) error 
 		return errors.WrapPrefix(r2.Err(), "failed to remove key", 0)
 	}
 	return nil
+}
+
+func (this *semaphore) holderScore() float64 {
+	return float64(time.Now().UnixMicro())
+}
+
+func (this *semaphore) expiredHolderScore() string {
+	return fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixMicro())
 }
 
 func (this *semaphore) Release(ctx context.Context, key string) error {

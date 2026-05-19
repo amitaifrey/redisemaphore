@@ -190,6 +190,27 @@ func TestSemaphore_KeyExpiration(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestSemaphore_HolderScoreUsesMicroseconds(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	before := float64(time.Now().Add(-time.Second).UnixMicro())
+	err = semaphore.Acquire(ctx, "key")
+	require.NoError(t, err)
+	after := float64(time.Now().Add(time.Second).UnixMicro())
+
+	score := client.ZScore(context.Background(), "semaphore", "key")
+	require.NoError(t, score.Err())
+	require.GreaterOrEqual(t, score.Val(), before)
+	require.LessOrEqual(t, score.Val(), after)
+}
+
 func TestSemaphore_DuplicateKeyWhileHeld(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
