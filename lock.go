@@ -12,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var ErrInvalidConfig = errors.New("error: invalid config")
 var ErrTimeout = errors.New("error: lock timeout")
 
 var errEmptyMutexToken = errors.New("error: empty mutex token")
@@ -23,45 +24,40 @@ end
 return 0
 `)
 
-type Mutex interface {
-	Acquire(ctx context.Context) error
-	Release(ctx context.Context) error
-}
-
 type MutexOption interface {
-	Apply(*mutex)
+	Apply(*Mutex)
 }
 
-type MutexOptionFunc func(*mutex)
+type MutexOptionFunc func(*Mutex)
 
-func (f MutexOptionFunc) Apply(m *mutex) {
+func (f MutexOptionFunc) Apply(m *Mutex) {
 	f(m)
 }
 
 func WithMutexPollDur(pollDur time.Duration) MutexOption {
-	return MutexOptionFunc(func(m *mutex) {
+	return MutexOptionFunc(func(m *Mutex) {
 		m.pollDur = pollDur
 	})
 }
 
 func WithMutexExpiry(expiry time.Duration) MutexOption {
-	return MutexOptionFunc(func(m *mutex) {
+	return MutexOptionFunc(func(m *Mutex) {
 		m.expiry = expiry
 	})
 }
 
 func WithMutexTimeout(timeout time.Duration) MutexOption {
-	return MutexOptionFunc(func(m *mutex) {
+	return MutexOptionFunc(func(m *Mutex) {
 		m.timeout = timeout
 	})
 }
 
-type mutex struct {
+type Mutex struct {
 	redisClient redis.UniversalClient
-	name        string
-	expiry      time.Duration // when the lock expires so other can take it, for when the lock holder dies
-	timeout     time.Duration // how long to wait for the lock to be released
-	pollDur     time.Duration // how often to poll for the lock
+	key         string
+	expiry      time.Duration
+	timeout     time.Duration
+	pollDur     time.Duration
 	// Release has no token parameter, so each mutex instance stores the active
 	// token. Serialize acquire/release lifecycles locally so a later acquire
 	// cannot overwrite that token before an earlier release uses it.
@@ -70,15 +66,18 @@ type mutex struct {
 	token     string
 }
 
-func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) Mutex {
-	return newMutex(redisClient, name, opts...)
+func NewMutex(redisClient redis.UniversalClient, namespace string, opts ...MutexOption) (*Mutex, error) {
+	if namespace == "" {
+		return nil, invalidConfig("mutex namespace must not be empty")
+	}
+	return newMutexWithKey(redisClient, redisMutexKey(namespace), opts...)
 }
 
-func newMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) *mutex {
-	m := &mutex{
+func newMutexWithKey(redisClient redis.UniversalClient, key string, opts ...MutexOption) (*Mutex, error) {
+	m := &Mutex{
 		redisClient: redisClient,
-		name:        name,
-		expiry:      1 * time.Minute,
+		key:         key,
+		expiry:      time.Minute,
 		timeout:     10 * time.Minute,
 		pollDur:     100 * time.Millisecond,
 		localLock:   make(chan struct{}, 1),
@@ -88,86 +87,109 @@ func newMutex(redisClient redis.UniversalClient, name string, opts ...MutexOptio
 		opt.Apply(m)
 	}
 
-	return m
+	if err := m.validate(); err != nil {
+		return nil, err
+	}
+
+	return m, nil
 }
 
-func (this *mutex) Acquire(ctx context.Context) error {
-	return this.acquireWithDescription(ctx, "")
+func (m *Mutex) validate() error {
+	if isNilRedisClient(m.redisClient) {
+		return invalidConfig("redis client must not be nil")
+	}
+	if m.key == "" {
+		return invalidConfig("mutex key must not be empty")
+	}
+	if m.expiry <= 0 {
+		return invalidConfig("mutex expiry must be positive")
+	}
+	if m.timeout <= 0 {
+		return invalidConfig("mutex timeout must be positive")
+	}
+	if m.pollDur <= 0 {
+		return invalidConfig("mutex poll duration must be positive")
+	}
+	return nil
 }
 
-func (this *mutex) acquireWithDescription(ctx context.Context, description string) error {
+func (m *Mutex) Acquire(ctx context.Context) error {
+	return m.acquireWithDescription(ctx, "")
+}
+
+func (m *Mutex) acquireWithDescription(ctx context.Context, description string) error {
 	token, err := newMutexToken(description)
 	if err != nil {
 		return err
 	}
-	return this.acquireWithToken(ctx, token)
+	return m.acquireWithToken(ctx, token)
 }
 
-func (this *mutex) acquireWithToken(ctx context.Context, token string) error {
+func (m *Mutex) acquireWithToken(ctx context.Context, token string) error {
 	if token == "" {
 		return errEmptyMutexToken
 	}
 
 	select {
-	case this.localLock <- struct{}{}:
+	case m.localLock <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	timeout := time.After(this.timeout)
+	timeout := time.After(m.timeout)
 	for {
-		r := this.redisClient.SetArgs(ctx, this.name, token, redis.SetArgs{
+		r := m.redisClient.SetArgs(ctx, m.key, token, redis.SetArgs{
 			Mode: "NX",
-			TTL:  this.expiry,
+			TTL:  m.expiry,
 		})
 		if r.Err() != nil && r.Err() != redis.Nil {
-			<-this.localLock
+			<-m.localLock
 			return r.Err()
 		}
 
 		result, err := r.Result()
 		if err != nil && err != redis.Nil {
-			<-this.localLock
+			<-m.localLock
 			return err
 		}
 		if result == "OK" {
-			this.stateMu.Lock()
-			this.token = token
-			this.stateMu.Unlock()
+			m.stateMu.Lock()
+			m.token = token
+			m.stateMu.Unlock()
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
-			<-this.localLock
+			<-m.localLock
 			return ctx.Err()
 		case <-timeout:
-			<-this.localLock
+			<-m.localLock
 			return ErrTimeout
-		case <-time.After(this.pollDur):
+		case <-time.After(m.pollDur):
 			continue
 		}
 	}
 }
 
-func (this *mutex) Release(ctx context.Context) error {
-	this.stateMu.Lock()
-	token := this.token
+func (m *Mutex) Release(ctx context.Context) error {
+	m.stateMu.Lock()
+	token := m.token
 	if token == "" {
-		this.stateMu.Unlock()
+		m.stateMu.Unlock()
 		return nil
 	}
 
-	if err := releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err(); err != nil {
-		this.stateMu.Unlock()
+	if err := releaseMutexScript.Run(ctx, m.redisClient, []string{m.key}, token).Err(); err != nil {
+		m.stateMu.Unlock()
 		return err
 	}
 
-	this.token = ""
-	this.stateMu.Unlock()
+	m.token = ""
+	m.stateMu.Unlock()
 
 	// A send acquires this buffered-channel gate; this receive releases it.
-	<-this.localLock
+	<-m.localLock
 	return nil
 }
 

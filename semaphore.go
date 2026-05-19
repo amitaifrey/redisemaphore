@@ -2,15 +2,15 @@ package redisemaphore
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/go-errors/errors"
 	"github.com/redis/go-redis/v9"
 )
 
-var ErrNoKeysLeft = errors.New("error: no keys left in queues")
+var errNoKeysLeft = errors.New("error: no keys left in queues")
 var ErrDuplicateKey = errors.New("error: duplicate key")
 
 var insertNextScript = redis.NewScript(`
@@ -25,104 +25,171 @@ redis.call("zrem", KEYS[2], ARGV[2])
 return 1
 `)
 
-type Semaphore interface {
-	Acquire(ctx context.Context, key string) error
-	Release(ctx context.Context, key string) error
-	AcquireQueue(ctx context.Context, queue, key string) error
-	ReleaseQueue(ctx context.Context, queue, key string) error
-}
-
 type SemaphoreOption interface {
-	Apply(*semaphore)
+	Apply(*Semaphore)
 }
 
-type SemaphoreOptionFunc func(*semaphore)
+type SemaphoreOptionFunc func(*Semaphore)
 
-func (f SemaphoreOptionFunc) Apply(s *semaphore) {
+func (f SemaphoreOptionFunc) Apply(s *Semaphore) {
 	f(s)
 }
 
-func WithSemaphoreMutexName(mutexName string) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
-		s.mutexName = mutexName
-	})
-}
-
 func WithSemaphoreMutexExpiry(mutexExpiry time.Duration) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
+	return SemaphoreOptionFunc(func(s *Semaphore) {
 		s.mutexExpiry = mutexExpiry
 	})
 }
 
 func WithSemaphoreMutexTimeout(mutexTimeout time.Duration) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
+	return SemaphoreOptionFunc(func(s *Semaphore) {
 		s.mutexTimeout = mutexTimeout
 	})
 }
 
-func WithSemaphoreDeleteTimeout(deleteTimeout time.Duration) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
-		s.deleteTimeout = deleteTimeout
+func WithSemaphorePermitTTL(permitTTL time.Duration) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *Semaphore) {
+		s.permitTTL = permitTTL
 	})
 }
 
 func WithSemaphorePollDur(pollDur time.Duration) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
+	return SemaphoreOptionFunc(func(s *Semaphore) {
 		s.pollDur = pollDur
 	})
 }
 
-func WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string) SemaphoreOption {
-	return SemaphoreOptionFunc(func(s *semaphore) {
-		s.queueKeysByPrio = queueKeysByPrio
+func WithSemaphoreQueuesByPriority(queueIDs ...string) SemaphoreOption {
+	return SemaphoreOptionFunc(func(s *Semaphore) {
+		s.queueIDsByPriority = queueIDs
 	})
 }
 
-type semaphore struct {
-	redisClient     redis.UniversalClient
-	mutex           *mutex
-	name            string
-	size            int
-	mutexName       string
-	mutexExpiry     time.Duration
-	mutexTimeout    time.Duration
-	deleteTimeout   time.Duration
-	pollDur         time.Duration
-	queueKeysByPrio []string
+type Semaphore struct {
+	redisClient        redis.UniversalClient
+	mutex              *Mutex
+	namespace          string
+	size               int
+	holderKey          string
+	mutexKey           string
+	mutexExpiry        time.Duration
+	mutexTimeout       time.Duration
+	permitTTL          time.Duration
+	pollDur            time.Duration
+	queueIDsByPriority []string
+	queueKeysByID      map[string]string
+	queueKeysByPrio    []string
 }
 
-func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts ...SemaphoreOption) (Semaphore, error) {
-	s := &semaphore{
-		redisClient:     redisClient,
-		name:            name,
-		size:            size,
-		mutexName:       fmt.Sprintf("%s-mutex", name),
-		mutexExpiry:     1 * time.Minute,
-		mutexTimeout:    10 * time.Minute,
-		deleteTimeout:   10 * time.Minute,
-		pollDur:         100 * time.Millisecond,
-		queueKeysByPrio: []string{fmt.Sprintf("%s-queue", name)},
+func NewSemaphore(redisClient redis.UniversalClient, namespace string, size int, opts ...SemaphoreOption) (*Semaphore, error) {
+	s := &Semaphore{
+		redisClient:        redisClient,
+		namespace:          namespace,
+		size:               size,
+		mutexExpiry:        time.Minute,
+		mutexTimeout:       10 * time.Minute,
+		permitTTL:          10 * time.Minute,
+		pollDur:            100 * time.Millisecond,
+		queueIDsByPriority: []string{"default"},
 	}
 
-	for _, o := range opts {
-		o.Apply(s)
+	for _, opt := range opts {
+		opt.Apply(s)
 	}
 
-	s.mutex = newMutex(redisClient, s.mutexName, WithMutexExpiry(s.mutexExpiry), WithMutexTimeout(s.mutexTimeout), WithMutexPollDur(s.pollDur))
+	if err := s.validateAndBuildKeys(); err != nil {
+		return nil, err
+	}
+
+	mutex, err := newMutexWithKey(
+		redisClient,
+		s.mutexKey,
+		WithMutexExpiry(s.mutexExpiry),
+		WithMutexTimeout(s.mutexTimeout),
+		WithMutexPollDur(s.pollDur),
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.mutex = mutex
 
 	return s, nil
 }
 
-func (this *semaphore) Acquire(ctx context.Context, key string) error {
-	if len(this.queueKeysByPrio) != 1 {
-		return fmt.Errorf("queue keys by prio must have exactly one element")
+func (s *Semaphore) validateAndBuildKeys() error {
+	if isNilRedisClient(s.redisClient) {
+		return invalidConfig("redis client must not be nil")
 	}
-	return this.AcquireQueue(ctx, this.queueKeysByPrio[0], key)
+	if s.namespace == "" {
+		return invalidConfig("semaphore namespace must not be empty")
+	}
+	if s.size <= 0 {
+		return invalidConfig("semaphore size must be positive")
+	}
+	if s.mutexExpiry <= 0 {
+		return invalidConfig("semaphore mutex expiry must be positive")
+	}
+	if s.mutexTimeout <= 0 {
+		return invalidConfig("semaphore mutex timeout must be positive")
+	}
+	if s.permitTTL <= 0 {
+		return invalidConfig("semaphore permit TTL must be positive")
+	}
+	if s.pollDur <= 0 {
+		return invalidConfig("semaphore poll duration must be positive")
+	}
+	if len(s.queueIDsByPriority) == 0 {
+		return invalidConfig("at least one semaphore queue must be configured")
+	}
+
+	s.holderKey = redisHolderKey(s.namespace)
+	s.mutexKey = redisMutexKey(s.namespace)
+	s.queueKeysByID = make(map[string]string, len(s.queueIDsByPriority))
+	s.queueKeysByPrio = make([]string, 0, len(s.queueIDsByPriority))
+
+	seenQueueIDs := make(map[string]struct{}, len(s.queueIDsByPriority))
+	seenRedisKeys := map[string]string{
+		s.holderKey: "holders",
+		s.mutexKey:  "mutex",
+	}
+	slot := redisClusterSlot(s.holderKey)
+
+	for _, queueID := range s.queueIDsByPriority {
+		if queueID == "" {
+			return invalidConfig("semaphore queue id must not be empty")
+		}
+		if _, exists := seenQueueIDs[queueID]; exists {
+			return invalidConfig("duplicate semaphore queue id %q", queueID)
+		}
+		seenQueueIDs[queueID] = struct{}{}
+
+		queueKey := redisQueueKey(s.namespace, queueID)
+		if owner, exists := seenRedisKeys[queueKey]; exists {
+			return invalidConfig("derived queue key for %q collides with %s key", queueID, owner)
+		}
+		if queueSlot := redisClusterSlot(queueKey); queueSlot != slot {
+			return invalidConfig("derived queue key for %q is in slot %d, want %d", queueID, queueSlot, slot)
+		}
+
+		seenRedisKeys[queueKey] = fmt.Sprintf("queue %q", queueID)
+		s.queueKeysByID[queueID] = queueKey
+		s.queueKeysByPrio = append(s.queueKeysByPrio, queueKey)
+	}
+
+	return nil
 }
 
-func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err error) {
-	if !slices.Contains(this.queueKeysByPrio, queue) {
-		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
+func (s *Semaphore) Acquire(ctx context.Context, key string) error {
+	return s.AcquireQueue(ctx, s.queueIDsByPriority[0], key)
+}
+
+func (s *Semaphore) AcquireQueue(ctx context.Context, queueID, key string) (err error) {
+	queueKey, err := s.queueKey(queueID)
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		return invalidConfig("semaphore key must not be empty")
 	}
 
 	registered := false
@@ -131,21 +198,21 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 		if !registered || acquired {
 			return
 		}
-		cleanupErr := this.withCleanupContext(ctx, func(ctx context.Context) error {
-			return this.cleanupWaiter(ctx, key)
+		cleanupErr := s.withCleanupContext(ctx, func(ctx context.Context) error {
+			return s.cleanupWaiter(ctx, key)
 		})
 		if err == nil && cleanupErr != nil {
 			err = cleanupErr
 		}
 	}()
 
-	if err = this.registerWaiter(ctx, queue, key); err != nil {
+	if err = s.registerWaiter(ctx, queueKey, key); err != nil {
 		return err
 	}
 	registered = true
 
 	for {
-		exists, err := this.keyExists(ctx, this.name, key)
+		exists, err := s.keyExists(ctx, s.holderKey, key)
 		if err != nil {
 			return errors.WrapPrefix(err, "failed to check if key exists", 0)
 		}
@@ -154,49 +221,49 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 			return nil
 		}
 
-		admitted, err := this.tryInsertNext(ctx, queue, key)
+		admitted, err := s.tryInsertNext(ctx, queueID, queueKey, key)
+		if err != nil {
+			return err
+		}
 		if admitted {
 			acquired = true
 			return nil
-		}
-		if err != nil {
-			return err
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(this.pollDur):
+		case <-time.After(s.pollDur):
 			continue
 		}
 	}
 }
 
-func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) (bool, error) {
+func (s *Semaphore) tryInsertNext(ctx context.Context, queueID, queueKey, key string) (bool, error) {
 	admitted := false
-	err := this.withMutex(ctx, this.mutexTokenDescription("fill", queue, key), func(ctx context.Context) error {
-		toAdd, err := this.amountToAdd(ctx)
+	err := s.withMutex(ctx, s.mutexTokenDescription("fill", queueID, key), func(ctx context.Context) error {
+		toAdd, err := s.amountToAdd(ctx)
 		if err != nil || toAdd <= 0 {
 			return err
 		}
 
 		for toAdd > 0 {
-			nextQueue, nextKey, err := this.getNextKey(ctx)
-			if err == ErrNoKeysLeft {
+			nextQueueKey, nextKey, err := s.getNextKey(ctx)
+			if err == errNoKeysLeft {
 				return nil
 			}
 			if err != nil {
 				return errors.WrapPrefix(err, "failed to get next key", 0)
 			}
 
-			inserted, err := this.insertNext(ctx, nextQueue, nextKey)
+			inserted, err := s.insertNext(ctx, nextQueueKey, nextKey)
 			if err != nil {
 				return errors.WrapPrefix(err, "failed to insert next key", 0)
 			}
 			if !inserted {
 				continue
 			}
-			if nextQueue == queue && nextKey == key {
+			if nextQueueKey == queueKey && nextKey == key {
 				admitted = true
 			}
 
@@ -208,13 +275,13 @@ func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) (bo
 	return admitted, err
 }
 
-func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) error {
-	return this.withMutex(ctx, this.mutexTokenDescription("register", queue, key), func(ctx context.Context) error {
-		if err := this.cleanupExpiredHolders(ctx); err != nil {
+func (s *Semaphore) registerWaiter(ctx context.Context, queueKey, key string) error {
+	return s.withMutex(ctx, s.mutexTokenDescription("register", queueKey, key), func(ctx context.Context) error {
+		if err := s.cleanupExpiredHolders(ctx); err != nil {
 			return err
 		}
 
-		exists, err := this.keyExists(ctx, this.name, key)
+		exists, err := s.keyExists(ctx, s.holderKey, key)
 		if err != nil {
 			return errors.WrapPrefix(err, "failed to check if key exists in semaphore", 0)
 		}
@@ -222,8 +289,8 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) er
 			return ErrDuplicateKey
 		}
 
-		for _, queueKey := range this.queueKeysByPrio {
-			exists, err := this.keyExists(ctx, queueKey, key)
+		for _, queueKey := range s.queueKeysByPrio {
+			exists, err := s.keyExists(ctx, queueKey, key)
 			if err != nil {
 				return errors.WrapPrefix(err, fmt.Sprintf("failed to check if key exists in queue: %s", queueKey), 0)
 			}
@@ -232,7 +299,7 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) er
 			}
 		}
 
-		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
+		addCmd := s.redisClient.ZAddArgs(ctx, queueKey, redis.ZAddArgs{
 			NX: true,
 			Members: []redis.Z{
 				{Score: float64(time.Now().UnixMicro()), Member: key},
@@ -249,80 +316,87 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) er
 	})
 }
 
-func (this *semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
-	err = this.mutex.acquireWithDescription(ctx, tokenDescription)
+func (s *Semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
+	err = s.mutex.acquireWithDescription(ctx, tokenDescription)
 	if err != nil {
 		return errors.WrapPrefix(err, "failed to acquire mutex", 0)
 	}
 	defer func() {
-		releaseErr := this.withCleanupContext(ctx, this.mutex.Release)
-		if err == nil && releaseErr != nil {
-			err = errors.WrapPrefix(releaseErr, "failed to release mutex", 0)
+		releaseErr := s.withCleanupContext(ctx, s.mutex.Release)
+		if releaseErr == nil {
+			return
 		}
+
+		releaseErr = errors.WrapPrefix(releaseErr, "failed to release mutex", 0)
+		if err == nil {
+			err = releaseErr
+			return
+		}
+		err = stderrors.Join(err, releaseErr)
 	}()
 
 	return fn(ctx)
 }
 
-func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
-	for _, queue := range this.queueKeysByPrio {
-		lenCmd := this.redisClient.ZCard(ctx, queue)
+func (s *Semaphore) getNextKey(ctx context.Context) (string, string, error) {
+	for _, queueKey := range s.queueKeysByPrio {
+		lenCmd := s.redisClient.ZCard(ctx, queueKey)
 		if lenCmd.Err() != nil {
-			return "", "", errors.WrapPrefix(lenCmd.Err(), fmt.Sprintf("failed to get length of queue: %s", queue), 0)
+			return "", "", errors.WrapPrefix(lenCmd.Err(), fmt.Sprintf("failed to get length of queue: %s", queueKey), 0)
 		}
-		if lenCmd.Val() == 0 { // guaranteed that at least one queue has a key
+		if lenCmd.Val() == 0 {
 			continue
 		}
 
-		readKeyCmd := this.redisClient.ZRange(ctx, queue, 0, 0)
+		readKeyCmd := s.redisClient.ZRange(ctx, queueKey, 0, 0)
 		if readKeyCmd.Err() != nil {
 			return "", "", errors.WrapPrefix(readKeyCmd.Err(), fmt.Sprintf("failed to get key: %s", readKeyCmd), 0)
 		}
 		if len(readKeyCmd.Val()) == 1 {
-			return queue, readKeyCmd.Val()[0], nil
+			return queueKey, readKeyCmd.Val()[0], nil
 		}
 	}
 
-	return "", "", ErrNoKeysLeft
+	return "", "", errNoKeysLeft
 }
 
-func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
-	if err := this.cleanupExpiredHolders(ctx); err != nil {
+func (s *Semaphore) amountToAdd(ctx context.Context) (int, error) {
+	if err := s.cleanupExpiredHolders(ctx); err != nil {
 		return -1, err
 	}
 
-	zcard := this.redisClient.ZCard(ctx, this.name)
+	zcard := s.redisClient.ZCard(ctx, s.holderKey)
 	if zcard.Err() != nil {
 		return -1, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
 	}
-	return this.size - int(zcard.Val()), nil
+	return s.size - int(zcard.Val()), nil
 }
 
-func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
-	cutoff := fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixMicro())
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", cutoff)
+func (s *Semaphore) cleanupExpiredHolders(ctx context.Context) error {
+	cutoff := fmt.Sprintf("%d", time.Now().Add(-s.permitTTL).UnixMicro())
+	r1 := s.redisClient.ZRemRangeByScore(ctx, s.holderKey, "-inf", cutoff)
 	if r1.Err() != nil {
 		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
 	}
 	return nil
 }
 
-func (this *semaphore) cleanupWaiter(ctx context.Context, key string) error {
-	return this.withMutex(ctx, this.mutexTokenDescription("cleanup-waiter", "", key), func(ctx context.Context) error {
-		for _, queue := range this.queueKeysByPrio {
-			if err := this.redisClient.ZRem(ctx, queue, key).Err(); err != nil && err != redis.Nil {
+func (s *Semaphore) cleanupWaiter(ctx context.Context, key string) error {
+	return s.withMutex(ctx, s.mutexTokenDescription("cleanup-waiter", "", key), func(ctx context.Context) error {
+		for _, queueKey := range s.queueKeysByPrio {
+			if err := s.redisClient.ZRem(ctx, queueKey, key).Err(); err != nil && err != redis.Nil {
 				return errors.WrapPrefix(err, "failed to remove key from queue", 0)
 			}
 		}
-		if err := this.redisClient.ZRem(ctx, this.name, key).Err(); err != nil && err != redis.Nil {
+		if err := s.redisClient.ZRem(ctx, s.holderKey, key).Err(); err != nil && err != redis.Nil {
 			return errors.WrapPrefix(err, "failed to remove key from semaphore", 0)
 		}
 		return nil
 	})
 }
 
-func (this *semaphore) keyExists(ctx context.Context, set, key string) (bool, error) {
-	rankCmd := this.redisClient.ZRank(ctx, set, key)
+func (s *Semaphore) keyExists(ctx context.Context, set, key string) (bool, error) {
+	rankCmd := s.redisClient.ZRank(ctx, set, key)
 	if rankCmd.Err() == nil {
 		return true, nil
 	}
@@ -332,19 +406,19 @@ func (this *semaphore) keyExists(ctx context.Context, set, key string) (bool, er
 	return false, rankCmd.Err()
 }
 
-func (this *semaphore) withCleanupContext(ctx context.Context, fn func(context.Context) error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), this.mutexTimeout)
+func (s *Semaphore) withCleanupContext(ctx context.Context, fn func(context.Context) error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.mutexTimeout)
 	defer cancel()
 	return fn(cleanupCtx)
 }
 
-func (this *semaphore) mutexTokenDescription(action, queue, key string) string {
-	return fmt.Sprintf("semaphore=%s action=%s queue=%s key=%s", this.name, action, queue, key)
+func (s *Semaphore) mutexTokenDescription(action, queueID, key string) string {
+	return fmt.Sprintf("semaphore=%s action=%s queue=%s key=%s", s.namespace, action, queueID, key)
 }
 
-func (this *semaphore) insertNext(ctx context.Context, queue, key string) (bool, error) {
+func (s *Semaphore) insertNext(ctx context.Context, queueKey, key string) (bool, error) {
 	score := fmt.Sprintf("%d", time.Now().UnixMicro())
-	result, err := insertNextScript.Run(ctx, this.redisClient, []string{this.name, queue}, score, key).Int()
+	result, err := insertNextScript.Run(ctx, s.redisClient, []string{s.holderKey, queueKey}, score, key).Int()
 	if err != nil {
 		return false, errors.WrapPrefix(err, "failed to move key from queue to semaphore", 0)
 	}
@@ -360,22 +434,25 @@ func (this *semaphore) insertNext(ctx context.Context, queue, key string) (bool,
 	}
 }
 
-func (this *semaphore) Release(ctx context.Context, key string) error {
-	if len(this.queueKeysByPrio) != 1 {
-		return fmt.Errorf("queue keys by prio must have exactly one element")
-	}
-	return this.ReleaseQueue(ctx, this.queueKeysByPrio[0], key)
-}
-
-func (this *semaphore) ReleaseQueue(ctx context.Context, queue, key string) error {
-	if !slices.Contains(this.queueKeysByPrio, queue) {
-		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
+func (s *Semaphore) Release(ctx context.Context, key string) error {
+	if key == "" {
+		return invalidConfig("semaphore key must not be empty")
 	}
 
-	// non-existing members are ignored, so if this was cleaned up this won't return an error
-	err := this.redisClient.ZRem(ctx, this.name, key).Err()
+	err := s.redisClient.ZRem(ctx, s.holderKey, key).Err()
 	if err == nil || err == redis.Nil {
 		return nil
 	}
 	return errors.WrapPrefix(err, "failed to remove key", 0)
+}
+
+func (s *Semaphore) queueKey(queueID string) (string, error) {
+	if queueID == "" {
+		return "", invalidConfig("semaphore queue id must not be empty")
+	}
+	queueKey, ok := s.queueKeysByID[queueID]
+	if !ok {
+		return "", invalidConfig("unknown semaphore queue %q", queueID)
+	}
+	return queueKey, nil
 }
