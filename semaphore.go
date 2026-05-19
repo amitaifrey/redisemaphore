@@ -70,7 +70,6 @@ type semaphore struct {
 	redisClient     redis.UniversalClient
 	mutex           TokenMutex
 	name            string
-	sequenceName    string
 	size            int
 	mutexName       string
 	mutexExpiry     time.Duration
@@ -84,7 +83,6 @@ func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts
 	s := &semaphore{
 		redisClient:     redisClient,
 		name:            name,
-		sequenceName:    fmt.Sprintf("%s-sequence", name),
 		size:            size,
 		mutexName:       fmt.Sprintf("%s-mutex", name),
 		mutexExpiry:     1 * time.Minute,
@@ -187,15 +185,10 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (r
 			}
 		}
 
-		seqCmd := this.redisClient.Incr(ctx, this.sequenceName)
-		if seqCmd.Err() != nil {
-			return errors.WrapPrefix(seqCmd.Err(), "failed to get queue sequence", 0)
-		}
-
 		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
 			NX: true,
 			Members: []redis.Z{
-				{Score: float64(seqCmd.Val()), Member: key},
+				{Score: this.waiterScore(), Member: key},
 			},
 		})
 		if addCmd.Err() != nil && addCmd.Err() != redis.Nil {
@@ -352,6 +345,10 @@ func (this *semaphore) insertNext(ctx context.Context, queue, key string) error 
 }
 
 func (this *semaphore) holderScore() float64 {
+	return float64(time.Now().UnixMicro())
+}
+
+func (this *semaphore) waiterScore() float64 {
 	return float64(time.Now().UnixMicro())
 }
 

@@ -211,6 +211,38 @@ func TestSemaphore_HolderScoreUsesMicroseconds(t *testing.T) {
 	require.LessOrEqual(t, score.Val(), after)
 }
 
+func TestSemaphore_WaiterScoreUsesMicroseconds(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err = semaphore.Acquire(ctx, "init")
+	require.NoError(t, err)
+
+	before := float64(time.Now().Add(-time.Second).UnixMicro())
+	acquired := make(chan string, 1)
+	errs := make(chan error, 1)
+	go acquireAndRelease(ctx, semaphore, "semaphore-queue", "queued", acquired, errs)
+
+	waitForZCard(t, client, "semaphore-queue", 1)
+	after := float64(time.Now().Add(time.Second).UnixMicro())
+
+	score := client.ZScore(context.Background(), "semaphore-queue", "queued")
+	require.NoError(t, score.Err())
+	require.GreaterOrEqual(t, score.Val(), before)
+	require.LessOrEqual(t, score.Val(), after)
+
+	err = semaphore.Release(context.Background(), "init")
+	require.NoError(t, err)
+	require.Equal(t, "queued", receiveString(t, acquired))
+	require.NoError(t, receiveError(t, errs))
+}
+
 func TestSemaphore_DuplicateKeyWhileHeld(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
@@ -307,7 +339,7 @@ func TestSemaphore_CanceledAcquireCleansWaiter(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestSemaphore_SamePriorityFIFO(t *testing.T) {
+func TestSemaphore_SamePriorityOlderWaitersFirst(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
 
@@ -332,6 +364,7 @@ func TestSemaphore_SamePriorityFIFO(t *testing.T) {
 	for i, key := range keys {
 		go acquireAndRelease(ctx, semaphore, "queue", key, acquired, errs)
 		waitForZCard(t, client, "queue", int64(i+1))
+		time.Sleep(time.Millisecond)
 	}
 
 	err = semaphore.ReleaseQueue(context.Background(), "queue", "init")
