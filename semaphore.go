@@ -117,7 +117,7 @@ func NewSemaphore(redisClient redis.UniversalClient, namespace string, size int,
 }
 
 func (s *Semaphore) validateAndBuildKeys() error {
-	if isNilRedisClient(s.redisClient) {
+	if s.redisClient == nil {
 		return invalidConfig("redis client must not be nil")
 	}
 	if s.namespace == "" {

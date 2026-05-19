@@ -95,7 +95,7 @@ func newMutexWithKey(redisClient redis.UniversalClient, key string, opts ...Mute
 }
 
 func (m *Mutex) validate() error {
-	if isNilRedisClient(m.redisClient) {
+	if m.redisClient == nil {
 		return invalidConfig("redis client must not be nil")
 	}
 	if m.key == "" {

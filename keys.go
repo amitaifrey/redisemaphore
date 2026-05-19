@@ -3,9 +3,6 @@ package redisemaphore
 import (
 	"fmt"
 	"net/url"
-	"reflect"
-
-	"github.com/redis/go-redis/v9"
 )
 
 const redisKeyPrefix = "redisemaphore"
@@ -35,17 +32,4 @@ func redisKey(namespace, suffix string) string {
 
 func escapeRedisKeyPart(part string) string {
 	return url.PathEscape(part)
-}
-
-func isNilRedisClient(client redis.UniversalClient) bool {
-	if client == nil {
-		return true
-	}
-	value := reflect.ValueOf(client)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
