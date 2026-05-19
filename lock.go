@@ -66,9 +66,12 @@ type mutex struct {
 	expiry      time.Duration // when the lock expires so other can take it, for when the lock holder dies
 	timeout     time.Duration // how long to wait for the lock to be released
 	pollDur     time.Duration // how often to poll for the lock
-	localLock   chan struct{}
-	stateMu     sync.Mutex
-	token       string
+	// Release has no token parameter, so each mutex instance stores the active
+	// token. Serialize acquire/release lifecycles locally so a later acquire
+	// cannot overwrite that token before an earlier release uses it.
+	localLock chan struct{}
+	stateMu   sync.Mutex
+	token     string
 }
 
 func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) TokenMutex {
@@ -154,6 +157,7 @@ func (this *mutex) Release(ctx context.Context) error {
 	this.stateMu.Unlock()
 
 	defer func() {
+		// A send acquires this buffered-channel gate; this receive releases it.
 		<-this.localLock
 	}()
 
