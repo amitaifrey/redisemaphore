@@ -2,6 +2,9 @@ package redisemaphore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"sync"
 	"time"
 
 	"github.com/go-errors/errors"
@@ -9,6 +12,13 @@ import (
 )
 
 var ErrTimeout = errors.New("error: lock timeout")
+
+var releaseMutexScript = redis.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+	return redis.call("del", KEYS[1])
+end
+return 0
+`)
 
 type Mutex interface {
 	Acquire(ctx context.Context) error
@@ -49,6 +59,9 @@ type mutex struct {
 	expiry      time.Duration // when the lock expires so other can take it, for when the lock holder dies
 	timeout     time.Duration // how long to wait for the lock to be released
 	pollDur     time.Duration // how often to poll for the lock
+	localLock   chan struct{}
+	stateMu     sync.Mutex
+	token       string
 }
 
 func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) Mutex {
@@ -58,6 +71,7 @@ func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOptio
 		expiry:      1 * time.Minute,
 		timeout:     10 * time.Minute,
 		pollDur:     100 * time.Millisecond,
+		localLock:   make(chan struct{}, 1),
 	}
 
 	for _, opt := range opts {
@@ -68,28 +82,47 @@ func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOptio
 }
 
 func (this *mutex) Acquire(ctx context.Context) error {
+	select {
+	case this.localLock <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	token, err := newMutexToken()
+	if err != nil {
+		<-this.localLock
+		return err
+	}
+
 	timeout := time.After(this.timeout)
 	for {
-		r := this.redisClient.SetArgs(ctx, this.name, "1", redis.SetArgs{
+		r := this.redisClient.SetArgs(ctx, this.name, token, redis.SetArgs{
 			Mode: "NX",
 			TTL:  this.expiry,
 		})
 		if r.Err() != nil && r.Err() != redis.Nil {
+			<-this.localLock
 			return r.Err()
 		}
 
 		result, err := r.Result()
 		if err != nil && err != redis.Nil {
+			<-this.localLock
 			return err
 		}
 		if result == "OK" {
+			this.stateMu.Lock()
+			this.token = token
+			this.stateMu.Unlock()
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
+			<-this.localLock
 			return ctx.Err()
 		case <-timeout:
+			<-this.localLock
 			return ErrTimeout
 		case <-time.After(this.pollDur):
 			continue
@@ -98,6 +131,26 @@ func (this *mutex) Acquire(ctx context.Context) error {
 }
 
 func (this *mutex) Release(ctx context.Context) error {
-	r := this.redisClient.Del(ctx, this.name)
-	return r.Err()
+	this.stateMu.Lock()
+	token := this.token
+	if token == "" {
+		this.stateMu.Unlock()
+		return nil
+	}
+	this.token = ""
+	this.stateMu.Unlock()
+
+	defer func() {
+		<-this.localLock
+	}()
+
+	return releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err()
+}
+
+func newMutexToken() (string, error) {
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token), nil
 }

@@ -11,6 +11,7 @@ import (
 )
 
 var ErrNoKeysLeft = errors.New("error: no keys left in queues")
+var ErrDuplicateKey = errors.New("error: duplicate key")
 
 type Semaphore interface {
 	Acquire(ctx context.Context, key string) error
@@ -69,6 +70,7 @@ type semaphore struct {
 	redisClient     redis.UniversalClient
 	mutex           Mutex
 	name            string
+	sequenceName    string
 	size            int
 	mutexName       string
 	mutexExpiry     time.Duration
@@ -82,6 +84,7 @@ func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts
 	s := &semaphore{
 		redisClient:     redisClient,
 		name:            name,
+		sequenceName:    fmt.Sprintf("%s-sequence", name),
 		size:            size,
 		mutexName:       fmt.Sprintf("%s-mutex", name),
 		mutexExpiry:     1 * time.Minute,
@@ -107,31 +110,41 @@ func (this *semaphore) Acquire(ctx context.Context, key string) error {
 	return this.AcquireQueue(ctx, this.queueKeysByPrio[0], key)
 }
 
-func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) error {
+func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err error) {
 	if !slices.Contains(this.queueKeysByPrio, queue) {
 		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
 	}
 
+	registered := false
+	acquired := false
+	defer func() {
+		if !registered || acquired {
+			return
+		}
+		cleanupErr := this.withCleanupContext(ctx, func(ctx context.Context) error {
+			return this.cleanupWaiter(ctx, key)
+		})
+		if err == nil && cleanupErr != nil {
+			err = cleanupErr
+		}
+	}()
+
+	registered, err = this.registerWaiter(ctx, queue, key)
+	if err != nil {
+		return err
+	}
+
 	for {
-		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
-			NX: true, // do not override score
-			Members: []redis.Z{
-				{Score: float64(time.Now().UnixNano()), Member: key},
-			}})
-		if addCmd.Err() != nil && addCmd.Err() != redis.Nil {
-			return errors.WrapPrefix(addCmd.Err(), "failed to push key", 0)
-		}
-
-		semaphoreExists := this.redisClient.ZRank(ctx, this.name, key)
-		if semaphoreExists.Err() == nil {
-			break
-		}
-		if semaphoreExists.Err() != nil && semaphoreExists.Err() != redis.Nil {
-			return errors.WrapPrefix(semaphoreExists.Err(), "failed to check if key exists", 0)
-		}
-
-		err := this.tryInsertNext(ctx)
+		exists, err := this.keyExists(ctx, this.name, key)
 		if err != nil {
+			return errors.WrapPrefix(err, "failed to check if key exists", 0)
+		}
+		if exists {
+			acquired = true
+			return nil
+		}
+
+		if err := this.tryInsertNext(ctx); err != nil {
 			return err
 		}
 
@@ -142,22 +155,78 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) erro
 			continue
 		}
 	}
-
-	remCmd := this.redisClient.ZRem(ctx, queue, key)
-	if remCmd.Err() != nil && remCmd.Err() != redis.Nil {
-		return errors.WrapPrefix(remCmd.Err(), "failed to remove key", 0)
-	}
-
-	return nil
 }
 
 func (this *semaphore) tryInsertNext(ctx context.Context) error {
-	err := this.mutex.Acquire(ctx)
+	return this.withMutex(ctx, func(ctx context.Context) error {
+		return this.fillAvailable(ctx)
+	})
+}
+
+func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (registered bool, err error) {
+	err = this.withMutex(ctx, func(ctx context.Context) error {
+		if err := this.cleanupExpiredHolders(ctx); err != nil {
+			return err
+		}
+
+		exists, err := this.keyExists(ctx, this.name, key)
+		if err != nil {
+			return errors.WrapPrefix(err, "failed to check if key exists in semaphore", 0)
+		}
+		if exists {
+			return ErrDuplicateKey
+		}
+
+		for _, queueKey := range this.queueKeysByPrio {
+			exists, err := this.keyExists(ctx, queueKey, key)
+			if err != nil {
+				return errors.WrapPrefix(err, fmt.Sprintf("failed to check if key exists in queue: %s", queueKey), 0)
+			}
+			if exists {
+				return ErrDuplicateKey
+			}
+		}
+
+		seqCmd := this.redisClient.Incr(ctx, this.sequenceName)
+		if seqCmd.Err() != nil {
+			return errors.WrapPrefix(seqCmd.Err(), "failed to get queue sequence", 0)
+		}
+
+		addCmd := this.redisClient.ZAddArgs(ctx, queue, redis.ZAddArgs{
+			NX: true,
+			Members: []redis.Z{
+				{Score: float64(seqCmd.Val()), Member: key},
+			},
+		})
+		if addCmd.Err() != nil && addCmd.Err() != redis.Nil {
+			return errors.WrapPrefix(addCmd.Err(), "failed to push key", 0)
+		}
+		if addCmd.Val() == 0 {
+			return ErrDuplicateKey
+		}
+
+		registered = true
+		return this.fillAvailable(ctx)
+	})
+	return registered, err
+}
+
+func (this *semaphore) withMutex(ctx context.Context, fn func(context.Context) error) (err error) {
+	err = this.mutex.Acquire(ctx)
 	if err != nil {
 		return errors.WrapPrefix(err, "failed to acquire mutex", 0)
 	}
-	defer this.mutex.Release(ctx)
+	defer func() {
+		releaseErr := this.withCleanupContext(ctx, this.mutex.Release)
+		if err == nil && releaseErr != nil {
+			err = errors.WrapPrefix(releaseErr, "failed to release mutex", 0)
+		}
+	}()
 
+	return fn(ctx)
+}
+
+func (this *semaphore) fillAvailable(ctx context.Context) error {
 	toAdd, err := this.amountToAdd(ctx)
 	if err != nil || toAdd <= 0 { // if there is no room err is nil so we can just return it
 		return err
@@ -193,7 +262,7 @@ func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
 			continue
 		}
 
-		readKeyCmd := this.redisClient.ZRangeByScore(ctx, queue, &redis.ZRangeBy{Min: "-inf", Max: "+inf", Offset: 0, Count: 1})
+		readKeyCmd := this.redisClient.ZRange(ctx, queue, 0, 0)
 		if readKeyCmd.Err() != nil {
 			return "", "", errors.WrapPrefix(readKeyCmd.Err(), fmt.Sprintf("failed to get key: %s", readKeyCmd), 0)
 		}
@@ -206,9 +275,8 @@ func (this *semaphore) getNextKey(ctx context.Context) (string, string, error) {
 }
 
 func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
-	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
-	if r1.Err() != nil {
-		return -1, errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
+	if err := this.cleanupExpiredHolders(ctx); err != nil {
+		return -1, err
 	}
 
 	zcard := this.redisClient.ZCard(ctx, this.name)
@@ -216,6 +284,49 @@ func (this *semaphore) amountToAdd(ctx context.Context) (int, error) {
 		return -1, errors.WrapPrefix(zcard.Err(), "failed to get length of semaphore", 0)
 	}
 	return this.size - int(zcard.Val()), nil
+}
+
+func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
+	r1 := this.redisClient.ZRemRangeByScore(ctx, this.name, "-inf", fmt.Sprintf("%d", time.Now().Add(-this.deleteTimeout).UnixNano()))
+	if r1.Err() != nil {
+		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
+	}
+	return nil
+}
+
+func (this *semaphore) cleanupWaiter(ctx context.Context, key string) error {
+	return this.withMutex(ctx, func(ctx context.Context) error {
+		return this.cleanupWaiterLocked(ctx, key)
+	})
+}
+
+func (this *semaphore) cleanupWaiterLocked(ctx context.Context, key string) error {
+	for _, queue := range this.queueKeysByPrio {
+		if err := this.redisClient.ZRem(ctx, queue, key).Err(); err != nil && err != redis.Nil {
+			return errors.WrapPrefix(err, "failed to remove key from queue", 0)
+		}
+	}
+	if err := this.redisClient.ZRem(ctx, this.name, key).Err(); err != nil && err != redis.Nil {
+		return errors.WrapPrefix(err, "failed to remove key from semaphore", 0)
+	}
+	return nil
+}
+
+func (this *semaphore) keyExists(ctx context.Context, set, key string) (bool, error) {
+	rankCmd := this.redisClient.ZRank(ctx, set, key)
+	if rankCmd.Err() == nil {
+		return true, nil
+	}
+	if rankCmd.Err() == redis.Nil {
+		return false, nil
+	}
+	return false, rankCmd.Err()
+}
+
+func (this *semaphore) withCleanupContext(ctx context.Context, fn func(context.Context) error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), this.mutexTimeout)
+	defer cancel()
+	return fn(cleanupCtx)
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {

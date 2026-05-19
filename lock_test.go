@@ -9,6 +9,7 @@ import (
 	"github.com/amitaifrey/redisemaphore"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setupRedis(t *testing.T) (*miniredis.Miniredis, redis.UniversalClient) {
@@ -104,4 +105,57 @@ func TestMutex_Release_Error(t *testing.T) {
 	err := mutex.Release(context.Background())
 
 	assert.NoError(t, err, "expected no error releasing a non-existent lock")
+}
+
+func TestMutex_ExpiredOwnerDoesNotReleaseNewOwner(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutexA := redisemaphore.NewMutex(
+		client,
+		"test-lock",
+		redisemaphore.WithMutexExpiry(100*time.Millisecond),
+		redisemaphore.WithMutexPollDur(10*time.Millisecond),
+	)
+	mutexB := redisemaphore.NewMutex(
+		client,
+		"test-lock",
+		redisemaphore.WithMutexExpiry(time.Minute),
+		redisemaphore.WithMutexPollDur(10*time.Millisecond),
+	)
+
+	err := mutexA.Acquire(context.Background())
+	require.NoError(t, err)
+
+	mr.FastForward(101 * time.Millisecond)
+
+	err = mutexB.Acquire(context.Background())
+	require.NoError(t, err)
+
+	err = mutexA.Release(context.Background())
+	require.NoError(t, err)
+	require.True(t, mr.Exists("test-lock"), "stale owner should not delete the newer owner's lock")
+
+	err = mutexB.Release(context.Background())
+	require.NoError(t, err)
+	require.False(t, mr.Exists("test-lock"), "new owner should still be able to release its lock")
+}
+
+func TestMutex_SameInstanceAcquireHonorsContext(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutex := redisemaphore.NewMutex(client, "test-lock")
+
+	err := mutex.Acquire(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err = mutex.Acquire(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	err = mutex.Release(context.Background())
+	require.NoError(t, err)
 }

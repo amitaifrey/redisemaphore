@@ -9,6 +9,7 @@ The semaphore itself has priorty queues, which allows tasks to be scheduled in a
 1. **Semaphore Acquisition and Release:**
    - Acquire and release semaphores directly or via named queues.
    - Configurable semaphore options (expiry, timeout, polling duration, etc.).
+   - Semaphore keys are unique acquisition tokens; use a different key for each independent permit.
 
 2. **Mutex Locking:**
    - Acquire and release mutex locks to prevent race conditions during semaphore operations.
@@ -90,6 +91,7 @@ func main() {
 Common errors:
 - `ErrNoKeysLeft`: Indicates that no keys are left in the queues.
 - `ErrTimeout`: Indicates that a lock acquisition has timed out.
+- `ErrDuplicateKey`: Indicates that a semaphore key is already waiting or holding a permit.
 
 ## Contributing
 
