@@ -13,6 +13,18 @@ import (
 var ErrNoKeysLeft = errors.New("error: no keys left in queues")
 var ErrDuplicateKey = errors.New("error: duplicate key")
 
+var insertNextScript = redis.NewScript(`
+if redis.call("zscore", KEYS[2], ARGV[2]) == false then
+	return 0
+end
+local added = redis.call("zadd", KEYS[1], "NX", ARGV[1], ARGV[2])
+if added == 0 then
+	return -1
+end
+redis.call("zrem", KEYS[2], ARGV[2])
+return 1
+`)
+
 type Semaphore interface {
 	Acquire(ctx context.Context, key string) error
 	Release(ctx context.Context, key string) error
@@ -68,7 +80,7 @@ func WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string) SemaphoreOption {
 
 type semaphore struct {
 	redisClient     redis.UniversalClient
-	mutex           TokenMutex
+	mutex           *mutex
 	name            string
 	size            int
 	mutexName       string
@@ -96,7 +108,7 @@ func NewSemaphore(redisClient redis.UniversalClient, name string, size int, opts
 		o.Apply(s)
 	}
 
-	s.mutex = NewMutex(redisClient, s.mutexName, WithMutexExpiry(s.mutexExpiry), WithMutexTimeout(s.mutexTimeout), WithMutexPollDur(s.pollDur))
+	s.mutex = newMutex(redisClient, s.mutexName, WithMutexExpiry(s.mutexExpiry), WithMutexTimeout(s.mutexTimeout), WithMutexPollDur(s.pollDur))
 
 	return s, nil
 }
@@ -142,7 +154,12 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 			return nil
 		}
 
-		if err := this.tryInsertNext(ctx, queue, key); err != nil {
+		admitted, err := this.tryInsertNext(ctx, queue, key)
+		if admitted {
+			acquired = true
+			return nil
+		}
+		if err != nil {
 			return err
 		}
 
@@ -155,8 +172,9 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 	}
 }
 
-func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) error {
-	return this.withMutex(ctx, this.mutexTokenDescription("fill", queue, key), func(ctx context.Context) error {
+func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) (bool, error) {
+	admitted := false
+	err := this.withMutex(ctx, this.mutexTokenDescription("fill", queue, key), func(ctx context.Context) error {
 		toAdd, err := this.amountToAdd(ctx)
 		if err != nil || toAdd <= 0 {
 			return err
@@ -171,9 +189,15 @@ func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) err
 				return errors.WrapPrefix(err, "failed to get next key", 0)
 			}
 
-			err = this.insertNext(ctx, nextQueue, nextKey)
+			inserted, err := this.insertNext(ctx, nextQueue, nextKey)
 			if err != nil {
 				return errors.WrapPrefix(err, "failed to insert next key", 0)
+			}
+			if !inserted {
+				continue
+			}
+			if nextQueue == queue && nextKey == key {
+				admitted = true
 			}
 
 			toAdd--
@@ -181,6 +205,7 @@ func (this *semaphore) tryInsertNext(ctx context.Context, queue, key string) err
 
 		return nil
 	})
+	return admitted, err
 }
 
 func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) error {
@@ -225,12 +250,7 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) er
 }
 
 func (this *semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
-	token, err := NewMutexToken(tokenDescription)
-	if err != nil {
-		return errors.WrapPrefix(err, "failed to create mutex token", 0)
-	}
-
-	err = this.mutex.AcquireWithToken(ctx, token)
+	err = this.mutex.acquireWithDescription(ctx, tokenDescription)
 	if err != nil {
 		return errors.WrapPrefix(err, "failed to acquire mutex", 0)
 	}
@@ -322,17 +342,22 @@ func (this *semaphore) mutexTokenDescription(action, queue, key string) string {
 	return fmt.Sprintf("semaphore=%s action=%s queue=%s key=%s", this.name, action, queue, key)
 }
 
-func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
-	r1 := this.redisClient.ZAdd(ctx, this.name, redis.Z{Score: float64(time.Now().UnixMicro()), Member: key})
-	if r1.Err() != nil {
-		return errors.WrapPrefix(r1.Err(), "failed to add key", 0)
+func (this *semaphore) insertNext(ctx context.Context, queue, key string) (bool, error) {
+	score := fmt.Sprintf("%d", time.Now().UnixMicro())
+	result, err := insertNextScript.Run(ctx, this.redisClient, []string{this.name, queue}, score, key).Int()
+	if err != nil {
+		return false, errors.WrapPrefix(err, "failed to move key from queue to semaphore", 0)
 	}
-
-	r2 := this.redisClient.ZRem(ctx, queue, key)
-	if r2.Err() != nil && r2.Err() != redis.Nil {
-		return errors.WrapPrefix(r2.Err(), "failed to remove key", 0)
+	switch result {
+	case 1:
+		return true, nil
+	case 0:
+		return false, nil
+	case -1:
+		return false, ErrDuplicateKey
+	default:
+		return false, fmt.Errorf("unexpected insert result: %d", result)
 	}
-	return nil
 }
 
 func (this *semaphore) Release(ctx context.Context, key string) error {
@@ -343,6 +368,10 @@ func (this *semaphore) Release(ctx context.Context, key string) error {
 }
 
 func (this *semaphore) ReleaseQueue(ctx context.Context, queue, key string) error {
+	if !slices.Contains(this.queueKeysByPrio, queue) {
+		return fmt.Errorf("queue %s is not in the list of queue keys by prio", queue)
+	}
+
 	// non-existing members are ignored, so if this was cleaned up this won't return an error
 	err := this.redisClient.ZRem(ctx, this.name, key).Err()
 	if err == nil || err == redis.Nil {

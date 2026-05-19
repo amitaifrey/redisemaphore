@@ -1,8 +1,8 @@
 # Redis-Based Distributed Semaphore Implementation, With Priority Queues
 
-This repository contains a Go implementation of a Redis-based semaphore mechanism that allows for distributed locking using Redis sorted sets. It also includes a mutex lock mechanism to ensure safe concurrent access. The distribution of the semaphore is based redis clusters, i.e. we rely on the correctness of the Redis cluster to ensure the semaphore's correctness.
+This repository contains a Go implementation of a Redis-based semaphore mechanism that allows for distributed locking using Redis sorted sets. It also includes a mutex lock mechanism to ensure safe concurrent access. The distribution of the semaphore is based on Redis, i.e. we rely on Redis atomic commands and Lua script atomicity to ensure the semaphore's correctness.
 
-The semaphore itself has priorty queues, which allows tasks to be scheduled in a specific order. This is useful for tasks that are preferred to be executed first, such as tasks that are more time-critical or tasks that have higher priority.
+The semaphore itself has priority queues, which allow tasks to be scheduled in a specific order. This is useful for tasks that are preferred to be executed first, such as tasks that are more time-critical or tasks that have higher priority.
 
 ## Features
 
@@ -33,11 +33,11 @@ package main
 
 import (
 	"context"
-    "log"
+	"log"
 	"time"
 
+	"github.com/amitaifrey/redisemaphore"
 	"github.com/redis/go-redis/v9"
-	"github.com/yourusername/redisemaphore"
 )
 
 func main() {
@@ -76,7 +76,7 @@ func main() {
 - `WithSemaphoreMutexName(name string)`: Set a custom name for the mutex.
 - `WithSemaphoreMutexExpiry(expiry time.Duration)`: Set the expiry duration for the mutex.
 - `WithSemaphoreMutexTimeout(timeout time.Duration)`: Set the timeout duration for acquiring the mutex.
-- `WithSemaphoreDeleteTimeout(deleteTimeout time.Duration)`: Set the timeout duration for deleting keys from the semaphore set.
+- `WithSemaphoreDeleteTimeout(deleteTimeout time.Duration)`: Set how long a held semaphore key can remain unreleased before it is treated as expired and cleaned up.
 - `WithSemaphorePollDur(pollDur time.Duration)`: Set the polling duration for the semaphore.
 - `WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string)`: Set the priority queue keys for the semaphore.
 
@@ -85,7 +85,6 @@ func main() {
 - `WithMutexPollDur(pollDur time.Duration)`: Set the polling duration for the mutex.
 - `WithMutexExpiry(expiry time.Duration)`: Set the expiry duration for the mutex.
 - `WithMutexTimeout(timeout time.Duration)`: Set the timeout duration for acquiring the mutex.
-- `AcquireWithToken(ctx context.Context, token string)`: Acquire a mutex with a caller-provided unique lease token for debugging or tracing stalled locks.
 
 ## Error Handling
 
@@ -93,7 +92,6 @@ Common errors:
 - `ErrNoKeysLeft`: Indicates that no keys are left in the queues.
 - `ErrTimeout`: Indicates that a lock acquisition has timed out.
 - `ErrDuplicateKey`: Indicates that a semaphore key is already waiting or holding a permit.
-- `ErrEmptyMutexToken`: Indicates that `AcquireWithToken` was called with an empty token.
 
 ## Contributing
 

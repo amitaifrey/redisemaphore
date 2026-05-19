@@ -13,7 +13,8 @@ import (
 )
 
 var ErrTimeout = errors.New("error: lock timeout")
-var ErrEmptyMutexToken = errors.New("error: empty mutex token")
+
+var errEmptyMutexToken = errors.New("error: empty mutex token")
 
 var releaseMutexScript = redis.NewScript(`
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -25,11 +26,6 @@ return 0
 type Mutex interface {
 	Acquire(ctx context.Context) error
 	Release(ctx context.Context) error
-}
-
-type TokenMutex interface {
-	Mutex
-	AcquireWithToken(ctx context.Context, token string) error
 }
 
 type MutexOption interface {
@@ -70,11 +66,16 @@ type mutex struct {
 	// token. Serialize acquire/release lifecycles locally so a later acquire
 	// cannot overwrite that token before an earlier release uses it.
 	localLock chan struct{}
+	releaseMu sync.Mutex
 	stateMu   sync.Mutex
 	token     string
 }
 
-func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) TokenMutex {
+func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) Mutex {
+	return newMutex(redisClient, name, opts...)
+}
+
+func newMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) *mutex {
 	m := &mutex{
 		redisClient: redisClient,
 		name:        name,
@@ -92,16 +93,20 @@ func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOptio
 }
 
 func (this *mutex) Acquire(ctx context.Context) error {
-	token, err := NewMutexToken("")
+	return this.acquireWithDescription(ctx, "")
+}
+
+func (this *mutex) acquireWithDescription(ctx context.Context, description string) error {
+	token, err := newMutexToken(description)
 	if err != nil {
 		return err
 	}
-	return this.AcquireWithToken(ctx, token)
+	return this.acquireWithToken(ctx, token)
 }
 
-func (this *mutex) AcquireWithToken(ctx context.Context, token string) error {
+func (this *mutex) acquireWithToken(ctx context.Context, token string) error {
 	if token == "" {
-		return ErrEmptyMutexToken
+		return errEmptyMutexToken
 	}
 
 	select {
@@ -147,24 +152,31 @@ func (this *mutex) AcquireWithToken(ctx context.Context, token string) error {
 }
 
 func (this *mutex) Release(ctx context.Context) error {
+	this.releaseMu.Lock()
+	defer this.releaseMu.Unlock()
+
 	this.stateMu.Lock()
 	token := this.token
 	if token == "" {
 		this.stateMu.Unlock()
 		return nil
 	}
+	this.stateMu.Unlock()
+
+	if err := releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err(); err != nil {
+		return err
+	}
+
+	this.stateMu.Lock()
 	this.token = ""
 	this.stateMu.Unlock()
 
-	defer func() {
-		// A send acquires this buffered-channel gate; this receive releases it.
-		<-this.localLock
-	}()
-
-	return releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err()
+	// A send acquires this buffered-channel gate; this receive releases it.
+	<-this.localLock
+	return nil
 }
 
-func NewMutexToken(description string) (string, error) {
+func newMutexToken(description string) (string, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err

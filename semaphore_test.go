@@ -51,6 +51,28 @@ func TestSemaphore_Acquire(t *testing.T) {
 	assert.Equal(t, int64(0), intCmd.Val())
 }
 
+func TestSemaphore_ImmediateAdmissionDoesNotWaitForPoll(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	semaphore, err := redisemaphore.NewSemaphore(
+		client,
+		"semaphore",
+		1,
+		redisemaphore.WithSemaphorePollDur(time.Hour),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err = semaphore.Acquire(ctx, "key")
+	require.NoError(t, err)
+
+	err = semaphore.Release(context.Background(), "key")
+	require.NoError(t, err)
+}
+
 func TestSemaphore_AcquireOrder(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
@@ -266,6 +288,22 @@ func TestSemaphore_DuplicateKeyWhileHeld(t *testing.T) {
 	holderSize := client.ZCard(context.Background(), "semaphore")
 	require.NoError(t, holderSize.Err())
 	require.Equal(t, int64(1), holderSize.Val())
+}
+
+func TestSemaphore_ReleaseQueueRejectsUnknownQueue(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	semaphore, err := redisemaphore.NewSemaphore(
+		client,
+		"semaphore",
+		1,
+		redisemaphore.WithSemaphoreQueueKeysByPrio("queue"),
+	)
+	require.NoError(t, err)
+
+	err = semaphore.ReleaseQueue(context.Background(), "unknown-queue", "key")
+	require.Error(t, err)
 }
 
 func TestSemaphore_DuplicateKeyWhileQueued(t *testing.T) {
