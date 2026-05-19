@@ -152,7 +152,6 @@ func (s *Semaphore) validateAndBuildKeys() error {
 		s.holderKey: "holders",
 		s.mutexKey:  "mutex",
 	}
-	slot := redisClusterSlot(s.holderKey)
 
 	for _, queueID := range s.queueIDsByPriority {
 		if queueID == "" {
@@ -166,9 +165,6 @@ func (s *Semaphore) validateAndBuildKeys() error {
 		queueKey := redisQueueKey(s.namespace, queueID)
 		if owner, exists := seenRedisKeys[queueKey]; exists {
 			return invalidConfig("derived queue key for %q collides with %s key", queueID, owner)
-		}
-		if queueSlot := redisClusterSlot(queueKey); queueSlot != slot {
-			return invalidConfig("derived queue key for %q is in slot %d, want %d", queueID, queueSlot, slot)
 		}
 
 		seenRedisKeys[queueKey] = fmt.Sprintf("queue %q", queueID)
