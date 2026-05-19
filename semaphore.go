@@ -13,6 +13,8 @@ import (
 var errNoKeysLeft = errors.New("error: no keys left in queues")
 var ErrDuplicateKey = errors.New("error: duplicate key")
 
+// Atomically move one waiter from a queue to the holder set. Returns 1 when it
+// moved the waiter, 0 when the waiter is no longer queued, and -1 on duplicate.
 var insertNextScript = redis.NewScript(`
 if redis.call("zscore", KEYS[2], ARGV[2]) == false then
 	return 0
@@ -190,6 +192,8 @@ func (s *Semaphore) AcquireQueue(ctx context.Context, queueID, key string) (err 
 
 	registered := false
 	acquired := false
+	// Once registered, a failed or canceled acquire must remove its key from
+	// Redis state so it cannot consume capacity after the caller leaves.
 	defer func() {
 		if !registered || acquired {
 			return
@@ -235,6 +239,8 @@ func (s *Semaphore) AcquireQueue(ctx context.Context, queueID, key string) (err 
 	}
 }
 
+// tryInsertNext fills available permits from the priority queues. It may admit
+// other waiters first; the return value only reports whether queueKey/key moved.
 func (s *Semaphore) tryInsertNext(ctx context.Context, queueID, queueKey, key string) (bool, error) {
 	admitted := false
 	err := s.withMutex(ctx, s.mutexTokenDescription("fill", queueID, key), func(ctx context.Context) error {
@@ -273,10 +279,12 @@ func (s *Semaphore) tryInsertNext(ctx context.Context, queueID, queueKey, key st
 
 func (s *Semaphore) registerWaiter(ctx context.Context, queueKey, key string) error {
 	return s.withMutex(ctx, s.mutexTokenDescription("register", queueKey, key), func(ctx context.Context) error {
+		// Expired holders are removed before duplicate checks so their keys can be reused.
 		if err := s.cleanupExpiredHolders(ctx); err != nil {
 			return err
 		}
 
+		// A key is a unique acquisition token across holders and every queue.
 		exists, err := s.keyExists(ctx, s.holderKey, key)
 		if err != nil {
 			return errors.WrapPrefix(err, "failed to check if key exists in semaphore", 0)
@@ -334,6 +342,8 @@ func (s *Semaphore) withMutex(ctx context.Context, tokenDescription string, fn f
 	return fn(ctx)
 }
 
+// getNextKey encodes priority by queue order; Redis sorted-set scores preserve
+// FIFO order within a single queue.
 func (s *Semaphore) getNextKey(ctx context.Context) (string, string, error) {
 	for _, queueKey := range s.queueKeysByPrio {
 		lenCmd := s.redisClient.ZCard(ctx, queueKey)
@@ -402,6 +412,7 @@ func (s *Semaphore) keyExists(ctx context.Context, set, key string) (bool, error
 	return false, rankCmd.Err()
 }
 
+// Cleanup/release must outlive caller cancellation, but still stay bounded.
 func (s *Semaphore) withCleanupContext(ctx context.Context, fn func(context.Context) error) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.mutexTimeout)
 	defer cancel()

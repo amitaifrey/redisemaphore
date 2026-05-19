@@ -17,6 +17,8 @@ var ErrTimeout = errors.New("error: lock timeout")
 
 var errEmptyMutexToken = errors.New("error: empty mutex token")
 
+// Check and delete in one Redis operation so an expired owner cannot release a
+// lock that a newer owner has already acquired.
 var releaseMutexScript = redis.NewScript(`
 if redis.call("get", KEYS[1]) == ARGV[1] then
 	return redis.call("del", KEYS[1])
@@ -58,12 +60,13 @@ type Mutex struct {
 	expiry      time.Duration
 	timeout     time.Duration
 	pollDur     time.Duration
-	// Release has no token parameter, so each mutex instance stores the active
-	// token. Serialize acquire/release lifecycles locally so a later acquire
-	// cannot overwrite that token before an earlier release uses it.
+
+	// localLock gates one active Acquire/Release lifecycle for this instance.
 	localLock chan struct{}
-	stateMu   sync.Mutex
-	token     string
+	// stateMu protects token so concurrent Release calls collapse to one script run.
+	stateMu sync.Mutex
+	// token is the Redis owner value for the active lock; Release has no token argument.
+	token string
 }
 
 func NewMutex(redisClient redis.UniversalClient, namespace string, opts ...MutexOption) (*Mutex, error) {
@@ -188,11 +191,13 @@ func (m *Mutex) Release(ctx context.Context) error {
 	m.token = ""
 	m.stateMu.Unlock()
 
-	// A send acquires this buffered-channel gate; this receive releases it.
+	// Release the local lifecycle gate only after the Redis release succeeds.
 	<-m.localLock
 	return nil
 }
 
+// newMutexToken adds a random nonce to the optional description. The description
+// is for Redis inspection; the nonce is the uniqueness/safety part.
 func newMutexToken(description string) (string, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {

@@ -27,6 +27,7 @@ func redisKey(namespace, suffix string) string {
 	// Redis Cluster hashes only the substring inside {...}. Keep every key for
 	// a semaphore namespace on that same escaped tag so multi-key Lua scripts
 	// can move waiters between queues and holders without CROSSSLOT errors.
+	// Escaping keeps user-provided braces from changing that hash tag.
 	return fmt.Sprintf("%s:{%s}:%s", redisKeyPrefix, escapeRedisKeyPart(namespace), suffix)
 }
 
