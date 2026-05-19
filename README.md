@@ -85,6 +85,7 @@ func main() {
 - `WithMutexPollDur(pollDur time.Duration)`: Set the polling duration for the mutex.
 - `WithMutexExpiry(expiry time.Duration)`: Set the expiry duration for the mutex.
 - `WithMutexTimeout(timeout time.Duration)`: Set the timeout duration for acquiring the mutex.
+- `AcquireWithToken(ctx context.Context, token string)`: Acquire a mutex with a caller-provided unique lease token for debugging or tracing stalled locks.
 
 ## Error Handling
 
@@ -92,6 +93,7 @@ Common errors:
 - `ErrNoKeysLeft`: Indicates that no keys are left in the queues.
 - `ErrTimeout`: Indicates that a lock acquisition has timed out.
 - `ErrDuplicateKey`: Indicates that a semaphore key is already waiting or holding a permit.
+- `ErrEmptyMutexToken`: Indicates that `AcquireWithToken` was called with an empty token.
 
 ## Contributing
 

@@ -141,6 +141,70 @@ func TestMutex_ExpiredOwnerDoesNotReleaseNewOwner(t *testing.T) {
 	require.False(t, mr.Exists("test-lock"), "new owner should still be able to release its lock")
 }
 
+func TestMutex_AcquireWithTokenUsesCallerToken(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutex := redisemaphore.NewMutex(client, "test-lock")
+
+	err := mutex.AcquireWithToken(context.Background(), "queue=q key=k nonce=1")
+	require.NoError(t, err)
+	lockValue, err := mr.Get("test-lock")
+	require.NoError(t, err)
+	require.Equal(t, "queue=q key=k nonce=1", lockValue)
+
+	err = mutex.Release(context.Background())
+	require.NoError(t, err)
+	require.False(t, mr.Exists("test-lock"))
+}
+
+func TestMutex_AcquireWithTokenRejectsEmptyToken(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutex := redisemaphore.NewMutex(client, "test-lock")
+
+	err := mutex.AcquireWithToken(context.Background(), "")
+	require.Equal(t, redisemaphore.ErrEmptyMutexToken, err)
+	require.False(t, mr.Exists("test-lock"))
+}
+
+func TestMutex_SameTrackingPrefixDifferentNonceDoesNotReleaseNewOwner(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutexA := redisemaphore.NewMutex(
+		client,
+		"test-lock",
+		redisemaphore.WithMutexExpiry(100*time.Millisecond),
+		redisemaphore.WithMutexPollDur(10*time.Millisecond),
+	)
+	mutexB := redisemaphore.NewMutex(
+		client,
+		"test-lock",
+		redisemaphore.WithMutexExpiry(time.Minute),
+		redisemaphore.WithMutexPollDur(10*time.Millisecond),
+	)
+
+	err := mutexA.AcquireWithToken(context.Background(), "queue=q key=k nonce=1")
+	require.NoError(t, err)
+
+	mr.FastForward(101 * time.Millisecond)
+
+	err = mutexB.AcquireWithToken(context.Background(), "queue=q key=k nonce=2")
+	require.NoError(t, err)
+
+	err = mutexA.Release(context.Background())
+	require.NoError(t, err)
+	lockValue, err := mr.Get("test-lock")
+	require.NoError(t, err)
+	require.Equal(t, "queue=q key=k nonce=2", lockValue)
+
+	err = mutexB.Release(context.Background())
+	require.NoError(t, err)
+	require.False(t, mr.Exists("test-lock"))
+}
+
 func TestMutex_SameInstanceAcquireHonorsContext(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()

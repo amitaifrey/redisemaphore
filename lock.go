@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 )
 
 var ErrTimeout = errors.New("error: lock timeout")
+var ErrEmptyMutexToken = errors.New("error: empty mutex token")
 
 var releaseMutexScript = redis.NewScript(`
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -23,6 +25,11 @@ return 0
 type Mutex interface {
 	Acquire(ctx context.Context) error
 	Release(ctx context.Context) error
+}
+
+type TokenMutex interface {
+	Mutex
+	AcquireWithToken(ctx context.Context, token string) error
 }
 
 type MutexOption interface {
@@ -64,7 +71,7 @@ type mutex struct {
 	token       string
 }
 
-func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) Mutex {
+func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOption) TokenMutex {
 	m := &mutex{
 		redisClient: redisClient,
 		name:        name,
@@ -82,16 +89,22 @@ func NewMutex(redisClient redis.UniversalClient, name string, opts ...MutexOptio
 }
 
 func (this *mutex) Acquire(ctx context.Context) error {
+	token, err := NewMutexToken("")
+	if err != nil {
+		return err
+	}
+	return this.AcquireWithToken(ctx, token)
+}
+
+func (this *mutex) AcquireWithToken(ctx context.Context, token string) error {
+	if token == "" {
+		return ErrEmptyMutexToken
+	}
+
 	select {
 	case this.localLock <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-
-	token, err := newMutexToken()
-	if err != nil {
-		<-this.localLock
-		return err
 	}
 
 	timeout := time.After(this.timeout)
@@ -147,10 +160,13 @@ func (this *mutex) Release(ctx context.Context) error {
 	return releaseMutexScript.Run(ctx, this.redisClient, []string{this.name}, token).Err()
 }
 
-func newMutexToken() (string, error) {
-	token := make([]byte, 16)
-	if _, err := rand.Read(token); err != nil {
+func NewMutexToken(description string) (string, error) {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(token), nil
+	if description == "" {
+		return hex.EncodeToString(nonce), nil
+	}
+	return fmt.Sprintf("%s nonce=%s", description, hex.EncodeToString(nonce)), nil
 }

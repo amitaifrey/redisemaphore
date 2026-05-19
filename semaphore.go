@@ -68,7 +68,7 @@ func WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string) SemaphoreOption {
 
 type semaphore struct {
 	redisClient     redis.UniversalClient
-	mutex           Mutex
+	mutex           TokenMutex
 	name            string
 	sequenceName    string
 	size            int
@@ -158,13 +158,13 @@ func (this *semaphore) AcquireQueue(ctx context.Context, queue, key string) (err
 }
 
 func (this *semaphore) tryInsertNext(ctx context.Context) error {
-	return this.withMutex(ctx, func(ctx context.Context) error {
+	return this.withMutex(ctx, this.mutexTokenDescription("fill", "", ""), func(ctx context.Context) error {
 		return this.fillAvailable(ctx)
 	})
 }
 
 func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (registered bool, err error) {
-	err = this.withMutex(ctx, func(ctx context.Context) error {
+	err = this.withMutex(ctx, this.mutexTokenDescription("register", queue, key), func(ctx context.Context) error {
 		if err := this.cleanupExpiredHolders(ctx); err != nil {
 			return err
 		}
@@ -211,8 +211,13 @@ func (this *semaphore) registerWaiter(ctx context.Context, queue, key string) (r
 	return registered, err
 }
 
-func (this *semaphore) withMutex(ctx context.Context, fn func(context.Context) error) (err error) {
-	err = this.mutex.Acquire(ctx)
+func (this *semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
+	token, err := NewMutexToken(tokenDescription)
+	if err != nil {
+		return errors.WrapPrefix(err, "failed to create mutex token", 0)
+	}
+
+	err = this.mutex.AcquireWithToken(ctx, token)
 	if err != nil {
 		return errors.WrapPrefix(err, "failed to acquire mutex", 0)
 	}
@@ -295,7 +300,7 @@ func (this *semaphore) cleanupExpiredHolders(ctx context.Context) error {
 }
 
 func (this *semaphore) cleanupWaiter(ctx context.Context, key string) error {
-	return this.withMutex(ctx, func(ctx context.Context) error {
+	return this.withMutex(ctx, this.mutexTokenDescription("cleanup-waiter", "", key), func(ctx context.Context) error {
 		return this.cleanupWaiterLocked(ctx, key)
 	})
 }
@@ -327,6 +332,10 @@ func (this *semaphore) withCleanupContext(ctx context.Context, fn func(context.C
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), this.mutexTimeout)
 	defer cancel()
 	return fn(cleanupCtx)
+}
+
+func (this *semaphore) mutexTokenDescription(action, queue, key string) string {
+	return fmt.Sprintf("semaphore=%s action=%s queue=%s key=%s", this.name, action, queue, key)
 }
 
 func (this *semaphore) insertNext(ctx context.Context, queue, key string) error {
