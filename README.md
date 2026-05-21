@@ -1,18 +1,22 @@
 # Redis-Based Semaphore Implementation, Optional Distribution and Priority Queues
 
-This repository contains a Go implementation of a Redis-based semaphore mechanism that allows for distributed locking using Redis sorted sets. It also includes a mutex lock mechanism to ensure safe concurrent access. The distribution of the semaphore is based redis clusters, i.e. we rely on the correctness of the Redis cluster to ensure the semaphore's correctness.
+This repository contains a Go implementation of a Redis-based semaphore mechanism that allows for distributed locking using Redis sorted sets. It also includes a mutex lock mechanism to ensure safe concurrent access. The distribution of the semaphore is based on Redis, i.e. we rely on Redis atomic commands and Lua script atomicity to ensure the semaphore's correctness.
 
-The semaphore itself has priorty queues, which allows tasks to be scheduled in a specific order. This is useful for tasks that are preferred to be executed first, such as tasks that are more time-critical or tasks that have higher priority.
+The semaphore itself has priority queues, which allow tasks to be scheduled in a specific order. This is useful for tasks that are preferred to be executed first, such as tasks that are more time-critical or tasks that have higher priority.
 
 ## Features
 
 1. **Semaphore Acquisition and Release:**
-   - Acquire and release semaphores directly or via named queues.
-   - Configurable semaphore options (expiry, timeout, polling duration, etc.).
+   - Acquire directly or via logical priority queue IDs.
+   - Release by semaphore key; release is independent of the queue used to acquire.
+   - Internally derived Redis keys share one hash tag, making semaphore promotion scripts Redis Cluster-safe by default.
+   - Semaphore keys are unique acquisition tokens; use a different key for each independent permit.
+   - Pods sharing one semaphore namespace must use the same size, queue IDs/order, permit TTL, and mutex expiry.
 
 2. **Mutex Locking:**
    - Acquire and release mutex locks to prevent race conditions during semaphore operations.
    - Configurable lock options (expiry, timeout, polling duration, etc.).
+   - Standalone mutex namespaces are separate from semaphore-internal mutexes.
 
 ## Installation
 
@@ -22,7 +26,7 @@ go get github.com/amitaifrey/redisemaphore
 
 ## Getting Started
 ### Prerequisites
-- Go (v1.18+)
+- Go 1.22+
 - Redis
 
 ### Example Usage 
@@ -32,11 +36,11 @@ package main
 
 import (
 	"context"
-    "log"
+	"log"
 	"time"
 
+	"github.com/amitaifrey/redisemaphore"
 	"github.com/redis/go-redis/v9"
-	"github.com/yourusername/redisemaphore"
 )
 
 func main() {
@@ -45,6 +49,7 @@ func main() {
 
 	// Initialize semaphore
 	sem, err := redisemaphore.NewSemaphore(client, "example-semaphore", 5,
+		redisemaphore.WithSemaphoreQueuesByPriority("high", "default"),
 		redisemaphore.WithSemaphoreMutexExpiry(2*time.Minute),
 		redisemaphore.WithSemaphorePollDur(200*time.Millisecond),
 	)
@@ -52,8 +57,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Acquire semaphore
-	err = sem.Acquire(ctx, "my-key")
+	// Acquire semaphore via a logical queue ID
+	err = sem.AcquireQueue(ctx, "high", "my-key")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,16 +73,19 @@ func main() {
 }
 ```
 
+The namespace and queue IDs are logical names, not raw Redis keys. Every pod that uses the same semaphore namespace must use the same semaphore configuration: size, queue IDs and order, permit TTL, and mutex expiry. Use a new namespace or clear that namespace's Redis keys before changing those values.
+
+Standalone mutexes created with `NewMutex` use a separate internal key space from semaphore-internal mutexes, so `NewMutex(client, "jobs")` will not block `NewSemaphore(client, "jobs", ...)`.
+
 ## Configuration Options
 
 ### Semaphore Options
 
-- `WithSemaphoreMutexName(name string)`: Set a custom name for the mutex.
 - `WithSemaphoreMutexExpiry(expiry time.Duration)`: Set the expiry duration for the mutex.
 - `WithSemaphoreMutexTimeout(timeout time.Duration)`: Set the timeout duration for acquiring the mutex.
-- `WithSemaphoreDeleteTimeout(deleteTimeout time.Duration)`: Set the timeout duration for deleting keys from the semaphore set.
+- `WithSemaphorePermitTTL(permitTTL time.Duration)`: Set how long a held semaphore key can remain unreleased before it is treated as expired and cleaned up.
 - `WithSemaphorePollDur(pollDur time.Duration)`: Set the polling duration for the semaphore.
-- `WithSemaphoreQueueKeysByPrio(queueKeysByPrio ...string)`: Set the priority queue keys for the semaphore.
+- `WithSemaphoreQueuesByPriority(queueIDs ...string)`: Set logical queue IDs from highest priority to lowest.
 
 ### Mutex Options
 
@@ -88,8 +96,10 @@ func main() {
 ## Error Handling
 
 Common errors:
-- `ErrNoKeysLeft`: Indicates that no keys are left in the queues.
+- `ErrInvalidConfig`: Indicates invalid constructor options or invalid acquire/release parameters.
 - `ErrTimeout`: Indicates that a lock acquisition has timed out.
+- `ErrDuplicateKey`: Indicates that a semaphore key is already waiting or holding a permit.
+Config mismatches for an existing semaphore namespace return an error wrapping `ErrInvalidConfig`.
 
 ## Contributing
 
