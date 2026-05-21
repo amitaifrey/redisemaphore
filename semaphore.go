@@ -104,6 +104,7 @@ func NewSemaphore(redisClient redis.UniversalClient, namespace string, size int,
 		return nil, err
 	}
 
+	// One mutex protects all holder and queue state for this semaphore namespace.
 	mutex, err := newMutexWithKey(
 		redisClient,
 		s.mutexKey,
@@ -421,6 +422,8 @@ func (s *Semaphore) withCleanupContext(ctx context.Context, fn func(context.Cont
 	return fn(cleanupCtx)
 }
 
+// The description becomes part of the Redis lock value for observability only;
+// all semaphore operations still contend on the single mutex key.
 func (s *Semaphore) mutexTokenDescription(action, queueID, key string) string {
 	return fmt.Sprintf("semaphore=%s action=%s queue=%s key=%s", s.namespace, action, queueID, key)
 }
