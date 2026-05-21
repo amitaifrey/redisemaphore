@@ -73,7 +73,7 @@ func NewMutex(redisClient redis.UniversalClient, namespace string, opts ...Mutex
 	if namespace == "" {
 		return nil, invalidConfig("mutex namespace must not be empty")
 	}
-	return newMutexWithKey(redisClient, redisMutexKey(namespace), opts...)
+	return newMutexWithKey(redisClient, redisStandaloneMutexKey(namespace), opts...)
 }
 
 func newMutexWithKey(redisClient redis.UniversalClient, key string, opts ...MutexOption) (*Mutex, error) {
@@ -133,26 +133,34 @@ func (m *Mutex) acquireWithToken(ctx context.Context, token string) error {
 		return errEmptyMutexToken
 	}
 
+	timeoutCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+
 	select {
 	case m.localLock <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-timeoutCtx.Done():
+		return mutexAcquireTimeoutErr(ctx, timeoutCtx)
 	}
 
-	timeout := time.After(m.timeout)
 	for {
-		r := m.redisClient.SetArgs(ctx, m.key, token, redis.SetArgs{
+		r := m.redisClient.SetArgs(timeoutCtx, m.key, token, redis.SetArgs{
 			Mode: "NX",
 			TTL:  m.expiry,
 		})
 		if r.Err() != nil && r.Err() != redis.Nil {
 			<-m.localLock
+			if timeoutCtx.Err() != nil {
+				return mutexAcquireTimeoutErr(ctx, timeoutCtx)
+			}
 			return r.Err()
 		}
 
 		result, err := r.Result()
 		if err != nil && err != redis.Nil {
 			<-m.localLock
+			if timeoutCtx.Err() != nil {
+				return mutexAcquireTimeoutErr(ctx, timeoutCtx)
+			}
 			return err
 		}
 		if result == "OK" {
@@ -163,16 +171,23 @@ func (m *Mutex) acquireWithToken(ctx context.Context, token string) error {
 		}
 
 		select {
-		case <-ctx.Done():
+		case <-timeoutCtx.Done():
 			<-m.localLock
-			return ctx.Err()
-		case <-timeout:
-			<-m.localLock
-			return ErrTimeout
+			return mutexAcquireTimeoutErr(ctx, timeoutCtx)
 		case <-time.After(m.pollDur):
 			continue
 		}
 	}
+}
+
+func mutexAcquireTimeoutErr(ctx, timeoutCtx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if timeoutCtx.Err() != nil {
+		return ErrTimeout
+	}
+	return ErrTimeout
 }
 
 func (m *Mutex) Release(ctx context.Context) error {

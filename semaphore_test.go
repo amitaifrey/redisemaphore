@@ -110,6 +110,36 @@ func TestSemaphore_ImmediateAdmissionDoesNotWaitForPoll(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestSemaphore_StandaloneMutexDoesNotBlockSemaphore(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutex, err := redisemaphore.NewMutex(client, "same")
+	require.NoError(t, err)
+	err = mutex.Acquire(context.Background())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, mutex.Release(context.Background()))
+	}()
+
+	semaphore, err := redisemaphore.NewSemaphore(
+		client,
+		"same",
+		1,
+		redisemaphore.WithSemaphoreMutexTimeout(50*time.Millisecond),
+		redisemaphore.WithSemaphorePollDur(10*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err = semaphore.Acquire(ctx, "key")
+	require.NoError(t, err)
+	err = semaphore.Release(context.Background(), "key")
+	require.NoError(t, err)
+}
+
 func TestSemaphore_AcquireOrder(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
@@ -226,11 +256,14 @@ func TestSemaphore_KeyExpiration(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
 
-	permitTTL := 2 * time.Second
+	permitTTL := time.Second
+	start := time.Unix(1_700_000_000, 0)
+	mr.SetTime(start)
+
 	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1, redisemaphore.WithSemaphorePermitTTL(permitTTL))
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	key1 := "key1"
@@ -240,6 +273,9 @@ func TestSemaphore_KeyExpiration(t *testing.T) {
 	intCmd := client.ZRank(ctx, testHolderKey("semaphore"), key1)
 	require.NoError(t, intCmd.Err())
 	require.Equal(t, int64(0), intCmd.Val())
+
+	mr.SetTime(start.Add(permitTTL + time.Microsecond))
+	mr.FastForward(permitTTL + time.Microsecond)
 
 	key2 := "key2"
 	err = semaphore.Acquire(ctx, key2)
@@ -253,9 +289,12 @@ func TestSemaphore_KeyExpiration(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestSemaphore_HolderScoreUsesMicroseconds(t *testing.T) {
+func TestSemaphore_HolderScoreUsesRedisTime(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
+
+	redisTime := time.Unix(1_700_000_000, 123_456_000)
+	mr.SetTime(redisTime)
 
 	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1)
 	require.NoError(t, err)
@@ -263,20 +302,21 @@ func TestSemaphore_HolderScoreUsesMicroseconds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	before := float64(time.Now().Add(-time.Second).UnixMicro())
 	err = semaphore.Acquire(ctx, "key")
 	require.NoError(t, err)
-	after := float64(time.Now().Add(time.Second).UnixMicro())
 
 	score := client.ZScore(context.Background(), testHolderKey("semaphore"), "key")
 	require.NoError(t, score.Err())
-	require.GreaterOrEqual(t, score.Val(), before)
-	require.LessOrEqual(t, score.Val(), after)
+	require.Equal(t, float64(redisTime.UnixMicro()), score.Val())
 }
 
-func TestSemaphore_WaiterScoreUsesMicroseconds(t *testing.T) {
+func TestSemaphore_WaiterScoreUsesRedisTime(t *testing.T) {
 	mr, client := setupRedis(t)
 	defer mr.Close()
+
+	holderTime := time.Unix(1_700_000_000, 0)
+	waiterTime := time.Unix(1_700_000_010, 654_321_000)
+	mr.SetTime(holderTime)
 
 	semaphore, err := redisemaphore.NewSemaphore(client, "semaphore", 1)
 	require.NoError(t, err)
@@ -287,18 +327,17 @@ func TestSemaphore_WaiterScoreUsesMicroseconds(t *testing.T) {
 	err = semaphore.Acquire(ctx, "init")
 	require.NoError(t, err)
 
-	before := float64(time.Now().Add(-time.Second).UnixMicro())
+	mr.SetTime(waiterTime)
+
 	acquired := make(chan string, 1)
 	errs := make(chan error, 1)
 	go acquireAndRelease(ctx, semaphore, "default", "queued", acquired, errs)
 
 	waitForZCard(t, client, testQueueKey("semaphore", "default"), 1)
-	after := float64(time.Now().Add(time.Second).UnixMicro())
 
 	score := client.ZScore(context.Background(), testQueueKey("semaphore", "default"), "queued")
 	require.NoError(t, score.Err())
-	require.GreaterOrEqual(t, score.Val(), before)
-	require.LessOrEqual(t, score.Val(), after)
+	require.Equal(t, float64(waiterTime.UnixMicro()), score.Val())
 
 	err = semaphore.Release(context.Background(), "init")
 	require.NoError(t, err)
@@ -345,6 +384,127 @@ func TestSemaphore_AcquireQueueRejectsUnknownQueue(t *testing.T) {
 
 	err = semaphore.AcquireQueue(context.Background(), "unknown-queue", "key")
 	require.ErrorIs(t, err, redisemaphore.ErrInvalidConfig)
+}
+
+func TestSemaphore_QueuesByPriorityCopiesInput(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	queues := []string{"queue"}
+	semaphore, err := redisemaphore.NewSemaphore(
+		client,
+		"semaphore",
+		1,
+		redisemaphore.WithSemaphoreQueuesByPriority(queues...),
+	)
+	require.NoError(t, err)
+
+	queues[0] = "mutated"
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err = semaphore.Acquire(ctx, "key")
+	require.NoError(t, err)
+	err = semaphore.Release(context.Background(), "key")
+	require.NoError(t, err)
+}
+
+func TestSemaphore_ConfigMismatchRejectsAcquire(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	baseSize := 2
+	baseOpts := []redisemaphore.SemaphoreOption{
+		redisemaphore.WithSemaphoreQueuesByPriority("high", "low"),
+		redisemaphore.WithSemaphorePermitTTL(30 * time.Second),
+		redisemaphore.WithSemaphoreMutexExpiry(15 * time.Second),
+	}
+
+	tests := []struct {
+		name string
+		size int
+		opts []redisemaphore.SemaphoreOption
+	}{
+		{
+			name: "size",
+			size: 3,
+			opts: baseOpts,
+		},
+		{
+			name: "queue order",
+			size: baseSize,
+			opts: []redisemaphore.SemaphoreOption{
+				redisemaphore.WithSemaphoreQueuesByPriority("low", "high"),
+				redisemaphore.WithSemaphorePermitTTL(30 * time.Second),
+				redisemaphore.WithSemaphoreMutexExpiry(15 * time.Second),
+			},
+		},
+		{
+			name: "permit ttl",
+			size: baseSize,
+			opts: []redisemaphore.SemaphoreOption{
+				redisemaphore.WithSemaphoreQueuesByPriority("high", "low"),
+				redisemaphore.WithSemaphorePermitTTL(time.Minute),
+				redisemaphore.WithSemaphoreMutexExpiry(15 * time.Second),
+			},
+		},
+		{
+			name: "mutex expiry",
+			size: baseSize,
+			opts: []redisemaphore.SemaphoreOption{
+				redisemaphore.WithSemaphoreQueuesByPriority("high", "low"),
+				redisemaphore.WithSemaphorePermitTTL(30 * time.Second),
+				redisemaphore.WithSemaphoreMutexExpiry(time.Minute),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace := "config-" + strings.ReplaceAll(tt.name, " ", "-")
+			base, err := redisemaphore.NewSemaphore(client, namespace, baseSize, baseOpts...)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			err = base.AcquireQueue(ctx, "high", "seed")
+			require.NoError(t, err)
+			err = base.Release(context.Background(), "seed")
+			require.NoError(t, err)
+
+			other, err := redisemaphore.NewSemaphore(client, namespace, tt.size, tt.opts...)
+			require.NoError(t, err)
+
+			err = other.AcquireQueue(ctx, "high", "other")
+			require.ErrorIs(t, err, redisemaphore.ErrInvalidConfig)
+		})
+	}
+}
+
+func TestSemaphore_ReleaseIgnoresConfigMismatch(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	base, err := redisemaphore.NewSemaphore(client, "config-release", 1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err = base.Acquire(ctx, "held")
+	require.NoError(t, err)
+
+	other, err := redisemaphore.NewSemaphore(client, "config-release", 2)
+	require.NoError(t, err)
+
+	err = other.Release(context.Background(), "held")
+	require.NoError(t, err)
+
+	holderSize := client.ZCard(context.Background(), testHolderKey("config-release"))
+	require.NoError(t, holderSize.Err())
+	require.Equal(t, int64(0), holderSize.Val())
 }
 
 func TestSemaphore_DuplicateKeyWhileQueued(t *testing.T) {

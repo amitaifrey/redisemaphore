@@ -11,19 +11,27 @@ func invalidConfig(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalidConfig, fmt.Sprintf(format, args...))
 }
 
-func redisMutexKey(namespace string) string {
-	return redisKey(namespace, "mutex")
+func redisStandaloneMutexKey(namespace string) string {
+	return fmt.Sprintf("%s:mutex:{%s}:lock", redisKeyPrefix, escapeRedisKeyPart(namespace))
 }
 
-func redisHolderKey(namespace string) string {
-	return redisKey(namespace, "holders")
+func redisSemaphoreMutexKey(namespace string) string {
+	return redisSemaphoreKey(namespace, "mutex")
 }
 
-func redisQueueKey(namespace, queueID string) string {
-	return redisKey(namespace, "queue:"+escapeRedisKeyPart(queueID))
+func redisSemaphoreConfigKey(namespace string) string {
+	return redisSemaphoreKey(namespace, "config")
 }
 
-func redisKey(namespace, suffix string) string {
+func redisSemaphoreHolderKey(namespace string) string {
+	return redisSemaphoreKey(namespace, "holders")
+}
+
+func redisSemaphoreQueueKey(namespace, queueID string) string {
+	return redisSemaphoreKey(namespace, "queue:"+escapeRedisKeyPart(queueID))
+}
+
+func redisSemaphoreKey(namespace, suffix string) string {
 	// Redis Cluster hashes only the substring inside {...}. Keep every key for
 	// a semaphore namespace on that same escaped tag so multi-key Lua scripts
 	// can move waiters between queues and holders without CROSSSLOT errors.

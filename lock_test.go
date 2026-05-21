@@ -217,8 +217,29 @@ func TestMutex_SameInstanceAcquireHonorsContext(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestMutex_SameInstanceAcquireHonorsMutexTimeout(t *testing.T) {
+	mr, client := setupRedis(t)
+	defer mr.Close()
+
+	mutex, err := redisemaphore.NewMutex(
+		client,
+		"test-lock",
+		redisemaphore.WithMutexTimeout(50*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	err = mutex.Acquire(context.Background())
+	require.NoError(t, err)
+
+	err = mutex.Acquire(context.Background())
+	require.ErrorIs(t, err, redisemaphore.ErrTimeout)
+
+	err = mutex.Release(context.Background())
+	require.NoError(t, err)
+}
+
 func testMutexKey(namespace string) string {
-	return testRedisKey(namespace, "mutex")
+	return fmt.Sprintf("redisemaphore:mutex:{%s}:lock", url.PathEscape(namespace))
 }
 
 func testHolderKey(namespace string) string {

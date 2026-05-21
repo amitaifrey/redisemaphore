@@ -2,6 +2,7 @@ package redisemaphore
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"time"
@@ -13,19 +14,60 @@ import (
 var errNoKeysLeft = errors.New("error: no keys left in queues")
 var ErrDuplicateKey = errors.New("error: duplicate key")
 
+const semaphoreConfigVersion = 1
+
+type semaphoreConfig struct {
+	Version                 int      `json:"version"`
+	Size                    int      `json:"size"`
+	PermitTTLMicroseconds   int64    `json:"permit_ttl_us"`
+	MutexExpiryMicroseconds int64    `json:"mutex_expiry_us"`
+	QueueIDsByPriority      []string `json:"queue_ids_by_priority"`
+}
+
 // A waiter is an acquire key that has been registered in a queue but has not
 // yet moved to the holder set. This script atomically moves one waiter to the
 // holder set; it returns 1 when moved, 0 when no longer queued, and -1 on duplicate.
 var insertNextScript = redis.NewScript(`
-if redis.call("zscore", KEYS[2], ARGV[2]) == false then
+if redis.call("zscore", KEYS[2], ARGV[1]) == false then
 	return 0
 end
-local added = redis.call("zadd", KEYS[1], "NX", ARGV[1], ARGV[2])
+local now = redis.call("time")
+local score = tonumber(now[1]) * 1000000 + tonumber(now[2])
+local added = redis.call("zadd", KEYS[1], "NX", score, ARGV[1])
 if added == 0 then
 	return -1
 end
-redis.call("zrem", KEYS[2], ARGV[2])
+redis.call("zrem", KEYS[2], ARGV[1])
 return 1
+`)
+
+var registerWaiterScript = redis.NewScript(`
+local now = redis.call("time")
+local score = tonumber(now[1]) * 1000000 + tonumber(now[2])
+local cutoff = score - tonumber(ARGV[1])
+redis.call("zremrangebyscore", KEYS[1], "-inf", cutoff)
+
+if redis.call("zscore", KEYS[1], ARGV[2]) ~= false then
+	return -1
+end
+for i = 3, #KEYS do
+	if redis.call("zscore", KEYS[i], ARGV[2]) ~= false then
+		return -1
+	end
+end
+
+local added = redis.call("zadd", KEYS[2], "NX", score, ARGV[2])
+if added == 0 then
+	return -1
+end
+return 1
+`)
+
+var cleanupExpiredHoldersScript = redis.NewScript(`
+local now = redis.call("time")
+local score = tonumber(now[1]) * 1000000 + tonumber(now[2])
+local cutoff = score - tonumber(ARGV[1])
+return redis.call("zremrangebyscore", KEYS[1], "-inf", cutoff)
 `)
 
 type SemaphoreOption interface {
@@ -64,7 +106,7 @@ func WithSemaphorePollDur(pollDur time.Duration) SemaphoreOption {
 
 func WithSemaphoreQueuesByPriority(queueIDs ...string) SemaphoreOption {
 	return SemaphoreOptionFunc(func(s *Semaphore) {
-		s.queueIDsByPriority = queueIDs
+		s.queueIDsByPriority = append([]string(nil), queueIDs...)
 	})
 }
 
@@ -75,6 +117,8 @@ type Semaphore struct {
 	size               int
 	holderKey          string
 	mutexKey           string
+	configKey          string
+	configValue        string
 	mutexExpiry        time.Duration
 	mutexTimeout       time.Duration
 	permitTTL          time.Duration
@@ -146,8 +190,9 @@ func (s *Semaphore) validateAndBuildKeys() error {
 		return invalidConfig("at least one semaphore queue must be configured")
 	}
 
-	s.holderKey = redisHolderKey(s.namespace)
-	s.mutexKey = redisMutexKey(s.namespace)
+	s.holderKey = redisSemaphoreHolderKey(s.namespace)
+	s.mutexKey = redisSemaphoreMutexKey(s.namespace)
+	s.configKey = redisSemaphoreConfigKey(s.namespace)
 	s.queueKeysByID = make(map[string]string, len(s.queueIDsByPriority))
 	s.queueKeysByPrio = make([]string, 0, len(s.queueIDsByPriority))
 
@@ -155,6 +200,7 @@ func (s *Semaphore) validateAndBuildKeys() error {
 	seenRedisKeys := map[string]string{
 		s.holderKey: "holders",
 		s.mutexKey:  "mutex",
+		s.configKey: "config",
 	}
 
 	for _, queueID := range s.queueIDsByPriority {
@@ -166,7 +212,7 @@ func (s *Semaphore) validateAndBuildKeys() error {
 		}
 		seenQueueIDs[queueID] = struct{}{}
 
-		queueKey := redisQueueKey(s.namespace, queueID)
+		queueKey := redisSemaphoreQueueKey(s.namespace, queueID)
 		if owner, exists := seenRedisKeys[queueKey]; exists {
 			return invalidConfig("derived queue key for %q collides with %s key", queueID, owner)
 		}
@@ -176,7 +222,32 @@ func (s *Semaphore) validateAndBuildKeys() error {
 		s.queueKeysByPrio = append(s.queueKeysByPrio, queueKey)
 	}
 
+	configValue, err := buildSemaphoreConfigValue(s.size, s.permitTTL, s.mutexExpiry, s.queueIDsByPriority)
+	if err != nil {
+		return err
+	}
+	s.configValue = configValue
+
 	return nil
+}
+
+func buildSemaphoreConfigValue(size int, permitTTL, mutexExpiry time.Duration, queueIDsByPriority []string) (string, error) {
+	config := semaphoreConfig{
+		Version:                 semaphoreConfigVersion,
+		Size:                    size,
+		PermitTTLMicroseconds:   durationMicroseconds(permitTTL),
+		MutexExpiryMicroseconds: durationMicroseconds(mutexExpiry),
+		QueueIDsByPriority:      append([]string(nil), queueIDsByPriority...),
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return "", errors.WrapPrefix(err, "failed to build semaphore config", 0)
+	}
+	return string(data), nil
+}
+
+func durationMicroseconds(duration time.Duration) int64 {
+	return (int64(duration) + int64(time.Microsecond) - 1) / int64(time.Microsecond)
 }
 
 func (s *Semaphore) Acquire(ctx context.Context, key string) error {
@@ -281,46 +352,67 @@ func (s *Semaphore) tryInsertNext(ctx context.Context, queueID, queueKey, key st
 
 func (s *Semaphore) registerWaiter(ctx context.Context, queueKey, key string) error {
 	return s.withMutex(ctx, s.mutexTokenDescription("register", queueKey, key), func(ctx context.Context) error {
-		// Expired holders are removed before duplicate checks so their keys can be reused.
-		if err := s.cleanupExpiredHolders(ctx); err != nil {
+		if err := s.ensureConfig(ctx); err != nil {
 			return err
 		}
 
 		// Registering the key makes it a waiter. The key must be unique across
-		// holders and every queue.
-		exists, err := s.keyExists(ctx, s.holderKey, key)
+		// holders and every queue. Expired holders are cleaned first in Redis time.
+		result, err := registerWaiterScript.Run(
+			ctx,
+			s.redisClient,
+			s.registerWaiterKeys(queueKey),
+			fmt.Sprintf("%d", durationMicroseconds(s.permitTTL)),
+			key,
+		).Int()
 		if err != nil {
-			return errors.WrapPrefix(err, "failed to check if key exists in semaphore", 0)
+			return errors.WrapPrefix(err, "failed to register waiter", 0)
 		}
-		if exists {
+		if result == -1 {
 			return ErrDuplicateKey
 		}
-
-		for _, queueKey := range s.queueKeysByPrio {
-			exists, err := s.keyExists(ctx, queueKey, key)
-			if err != nil {
-				return errors.WrapPrefix(err, fmt.Sprintf("failed to check if key exists in queue: %s", queueKey), 0)
-			}
-			if exists {
-				return ErrDuplicateKey
-			}
-		}
-
-		addCmd := s.redisClient.ZAddArgs(ctx, queueKey, redis.ZAddArgs{
-			NX: true,
-			Members: []redis.Z{
-				{Score: float64(time.Now().UnixMicro()), Member: key},
-			},
-		})
-		if addCmd.Err() != nil && addCmd.Err() != redis.Nil {
-			return errors.WrapPrefix(addCmd.Err(), "failed to push key", 0)
-		}
-		if addCmd.Val() == 0 {
-			return ErrDuplicateKey
+		if result != 1 {
+			return fmt.Errorf("unexpected register waiter result: %d", result)
 		}
 
 		return nil
 	})
+}
+
+func (s *Semaphore) ensureConfig(ctx context.Context) error {
+	created, err := s.redisClient.SetNX(ctx, s.configKey, s.configValue, 0).Result()
+	if err != nil {
+		return errors.WrapPrefix(err, "failed to set semaphore config", 0)
+	}
+	if created {
+		return nil
+	}
+
+	value, err := s.redisClient.Get(ctx, s.configKey).Result()
+	if err == redis.Nil {
+		created, err = s.redisClient.SetNX(ctx, s.configKey, s.configValue, 0).Result()
+		if err != nil {
+			return errors.WrapPrefix(err, "failed to set semaphore config", 0)
+		}
+		if created {
+			return nil
+		}
+		value, err = s.redisClient.Get(ctx, s.configKey).Result()
+	}
+	if err != nil {
+		return errors.WrapPrefix(err, "failed to get semaphore config", 0)
+	}
+	if value != s.configValue {
+		return invalidConfig("semaphore namespace %q config mismatch", s.namespace)
+	}
+	return nil
+}
+
+func (s *Semaphore) registerWaiterKeys(queueKey string) []string {
+	keys := make([]string, 0, 2+len(s.queueKeysByPrio))
+	keys = append(keys, s.holderKey, queueKey)
+	keys = append(keys, s.queueKeysByPrio...)
+	return keys
 }
 
 func (s *Semaphore) withMutex(ctx context.Context, tokenDescription string, fn func(context.Context) error) (err error) {
@@ -345,8 +437,8 @@ func (s *Semaphore) withMutex(ctx context.Context, tokenDescription string, fn f
 	return fn(ctx)
 }
 
-// getNextKey encodes priority by queue order; Redis sorted-set scores preserve
-// FIFO order within a single queue.
+// getNextKey encodes priority by queue order. Within one queue, lower scores are
+// older; exact score ties use Redis member ordering.
 func (s *Semaphore) getNextKey(ctx context.Context) (string, string, error) {
 	for _, queueKey := range s.queueKeysByPrio {
 		lenCmd := s.redisClient.ZCard(ctx, queueKey)
@@ -382,10 +474,14 @@ func (s *Semaphore) amountToAdd(ctx context.Context) (int, error) {
 }
 
 func (s *Semaphore) cleanupExpiredHolders(ctx context.Context) error {
-	cutoff := fmt.Sprintf("%d", time.Now().Add(-s.permitTTL).UnixMicro())
-	r1 := s.redisClient.ZRemRangeByScore(ctx, s.holderKey, "-inf", cutoff)
-	if r1.Err() != nil {
-		return errors.WrapPrefix(r1.Err(), "failed to clean up semaphore", 0)
+	err := cleanupExpiredHoldersScript.Run(
+		ctx,
+		s.redisClient,
+		[]string{s.holderKey},
+		fmt.Sprintf("%d", durationMicroseconds(s.permitTTL)),
+	).Err()
+	if err != nil {
+		return errors.WrapPrefix(err, "failed to clean up semaphore", 0)
 	}
 	return nil
 }
@@ -429,8 +525,7 @@ func (s *Semaphore) mutexTokenDescription(action, queueID, key string) string {
 }
 
 func (s *Semaphore) insertNext(ctx context.Context, queueKey, key string) (bool, error) {
-	score := fmt.Sprintf("%d", time.Now().UnixMicro())
-	result, err := insertNextScript.Run(ctx, s.redisClient, []string{s.holderKey, queueKey}, score, key).Int()
+	result, err := insertNextScript.Run(ctx, s.redisClient, []string{s.holderKey, queueKey}, key).Int()
 	if err != nil {
 		return false, errors.WrapPrefix(err, "failed to move key from queue to semaphore", 0)
 	}

@@ -11,10 +11,12 @@ The semaphore itself has priority queues, which allow tasks to be scheduled in a
    - Release by semaphore key; release is independent of the queue used to acquire.
    - Internally derived Redis keys share one hash tag, making semaphore promotion scripts Redis Cluster-safe by default.
    - Semaphore keys are unique acquisition tokens; use a different key for each independent permit.
+   - Pods sharing one semaphore namespace must use the same size, queue IDs/order, permit TTL, and mutex expiry.
 
 2. **Mutex Locking:**
    - Acquire and release mutex locks to prevent race conditions during semaphore operations.
    - Configurable lock options (expiry, timeout, polling duration, etc.).
+   - Standalone mutex namespaces are separate from semaphore-internal mutexes.
 
 ## Installation
 
@@ -71,7 +73,9 @@ func main() {
 }
 ```
 
-The namespace and queue IDs are logical names, not raw Redis keys. For namespace `example-semaphore`, the library derives keys such as `redisemaphore:{example-semaphore}:holders`, `redisemaphore:{example-semaphore}:mutex`, and `redisemaphore:{example-semaphore}:queue:high`.
+The namespace and queue IDs are logical names, not raw Redis keys. Every pod that uses the same semaphore namespace must use the same semaphore configuration: size, queue IDs and order, permit TTL, and mutex expiry. Use a new namespace or clear that namespace's Redis keys before changing those values.
+
+Standalone mutexes created with `NewMutex` use a separate internal key space from semaphore-internal mutexes, so `NewMutex(client, "jobs")` will not block `NewSemaphore(client, "jobs", ...)`.
 
 ## Configuration Options
 
@@ -95,6 +99,7 @@ Common errors:
 - `ErrInvalidConfig`: Indicates invalid constructor options or invalid acquire/release parameters.
 - `ErrTimeout`: Indicates that a lock acquisition has timed out.
 - `ErrDuplicateKey`: Indicates that a semaphore key is already waiting or holding a permit.
+Config mismatches for an existing semaphore namespace return an error wrapping `ErrInvalidConfig`.
 
 ## Contributing
 

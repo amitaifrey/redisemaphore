@@ -10,10 +10,11 @@ import (
 func TestDerivedSemaphoreKeysShareClusterHashTag(t *testing.T) {
 	namespace := "tenant{danger}:one"
 	keys := []string{
-		redisHolderKey(namespace),
-		redisMutexKey(namespace),
-		redisQueueKey(namespace, "high{danger}"),
-		redisQueueKey(namespace, "low"),
+		redisSemaphoreHolderKey(namespace),
+		redisSemaphoreMutexKey(namespace),
+		redisSemaphoreConfigKey(namespace),
+		redisSemaphoreQueueKey(namespace, "high{danger}"),
+		redisSemaphoreQueueKey(namespace, "low"),
 	}
 
 	wantTag := "{tenant%7Bdanger%7D:one}"
@@ -21,6 +22,6 @@ func TestDerivedSemaphoreKeysShareClusterHashTag(t *testing.T) {
 		require.Contains(t, key, wantTag)
 	}
 
-	require.True(t, strings.Contains(keys[2], "queue:high%7Bdanger%7D"))
-	require.NotContains(t, keys[2], "{danger}")
+	require.True(t, strings.Contains(keys[3], "queue:high%7Bdanger%7D"))
+	require.NotContains(t, keys[3], "{danger}")
 }
