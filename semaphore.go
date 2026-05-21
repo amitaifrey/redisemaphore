@@ -13,8 +13,9 @@ import (
 var errNoKeysLeft = errors.New("error: no keys left in queues")
 var ErrDuplicateKey = errors.New("error: duplicate key")
 
-// Atomically move one waiter from a queue to the holder set. Returns 1 when it
-// moved the waiter, 0 when the waiter is no longer queued, and -1 on duplicate.
+// A waiter is an acquire key that has been registered in a queue but has not
+// yet moved to the holder set. This script atomically moves one waiter to the
+// holder set; it returns 1 when moved, 0 when no longer queued, and -1 on duplicate.
 var insertNextScript = redis.NewScript(`
 if redis.call("zscore", KEYS[2], ARGV[2]) == false then
 	return 0
@@ -284,7 +285,8 @@ func (s *Semaphore) registerWaiter(ctx context.Context, queueKey, key string) er
 			return err
 		}
 
-		// A key is a unique acquisition token across holders and every queue.
+		// Registering the key makes it a waiter. The key must be unique across
+		// holders and every queue.
 		exists, err := s.keyExists(ctx, s.holderKey, key)
 		if err != nil {
 			return errors.WrapPrefix(err, "failed to check if key exists in semaphore", 0)
