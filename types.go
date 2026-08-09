@@ -3,6 +3,7 @@ package redisemaphore
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -14,130 +15,140 @@ var (
 	ErrLeaseLost        = errors.New("redisemaphore: lease ownership lost")
 )
 
-// EventType identifies an observable state transition.
-type EventType string
-
 const (
-	EventAcquireStart    EventType = "acquire_start"
-	EventAcquireSuccess  EventType = "acquire_success"
-	EventAcquireFailure  EventType = "acquire_failure"
-	EventLeaseRenewed    EventType = "lease_renewed"
-	EventLeaseRenewError EventType = "lease_renew_error"
-	EventLeaseLost       EventType = "lease_lost"
-	EventRelease         EventType = "release"
-	EventCleanup         EventType = "cleanup"
-	EventPruned          EventType = "pruned"
-	EventRedisError      EventType = "redis_error"
+	logEventAcquireStart    = "acquire_start"
+	logEventAcquireSuccess  = "acquire_success"
+	logEventAcquireFailure  = "acquire_failure"
+	logEventLeaseRenewed    = "lease_renewed"
+	logEventLeaseRenewError = "lease_renew_error"
+	logEventLeaseLost       = "lease_lost"
+	logEventRelease         = "release"
+	logEventCleanup         = "cleanup"
+	logEventPruned          = "pruned"
+	logEventRedisError      = "redis_error"
 )
 
-// Event is deliberately low-cardinality. RequestID is provided for logs and
-// traces, but callers should not use it as a metric label.
-type Event struct {
-	Type          EventType
-	Resource      string
-	Namespace     string
-	Queue         string
-	RequestID     string
-	WaitDuration  time.Duration
-	Holders       int64
-	Waiters       int64
-	PrunedHolders int64
-	PrunedWaiters int64
-	Err           error
+const (
+	logAttrEvent         = "event"
+	logAttrEventTime     = "event_time"
+	logAttrResource      = "resource"
+	logAttrNamespace     = "namespace"
+	logAttrQueue         = "queue"
+	logAttrRequestID     = "request_id"
+	logAttrWaitDuration  = "wait_duration"
+	logAttrHolders       = "holders"
+	logAttrWaiters       = "waiters"
+	logAttrPrunedHolders = "pruned_holders"
+	logAttrPrunedWaiters = "pruned_waiters"
+	logAttrError         = "error"
+)
+
+// Logger receives structured diagnostic events. *slog.Logger implements Logger
+// directly.
+type Logger interface {
+	LogAttrs(context.Context, slog.Level, string, ...slog.Attr)
 }
 
-type Observer interface {
-	Observe(context.Context, Event)
+var _ Logger = (*slog.Logger)(nil)
+
+const loggerQueueCapacity = 64
+
+type logDelivery struct {
+	ctx     context.Context
+	level   slog.Level
+	message string
+	attrs   []slog.Attr
 }
 
-type ObserverFunc func(context.Context, Event)
-
-func (f ObserverFunc) Observe(ctx context.Context, event Event) {
-	f(ctx, event)
-}
-
-const observerQueueCapacity = 64
-
-type observerDelivery struct {
-	ctx   context.Context
-	event Event
-}
-
-// boundedObserver removes user-provided observability code from ownership and
-// renewal paths. It keeps at most one delivery goroutine and a fixed-size
+// boundedLogger removes user-provided logging code from ownership and renewal
+// paths. It keeps at most one delivery goroutine and a fixed-size
 // queue. When the queue is full, the oldest event is discarded so recent
 // lease-loss and Redis-error signals are retained preferentially.
-type boundedObserver struct {
-	delegate Observer
+type boundedLogger struct {
+	delegate Logger
 
 	mu      sync.Mutex
-	queue   [observerQueueCapacity]observerDelivery
+	queue   [loggerQueueCapacity]logDelivery
 	head    int
 	size    int
 	running bool
 }
 
-func newNonBlockingObserver(observer Observer) Observer {
-	if observer == nil {
+func newNonBlockingLogger(logger Logger) Logger {
+	if logger == nil {
 		return nil
 	}
-	if _, ok := observer.(*boundedObserver); ok {
-		return observer
+	if _, ok := logger.(*boundedLogger); ok {
+		return logger
 	}
-	return &boundedObserver{delegate: observer}
+	return &boundedLogger{delegate: logger}
 }
 
-func (o *boundedObserver) Observe(ctx context.Context, event Event) {
-	o.mu.Lock()
-	if o.size == len(o.queue) {
-		o.queue[o.head] = observerDelivery{}
-		o.head = (o.head + 1) % len(o.queue)
-		o.size--
+func (l *boundedLogger) LogAttrs(ctx context.Context, level slog.Level, message string, attrs ...slog.Attr) {
+	delivery := logDelivery{
+		ctx:     ctx,
+		level:   level,
+		message: message,
+		attrs:   append([]slog.Attr(nil), attrs...),
 	}
-	tail := (o.head + o.size) % len(o.queue)
-	o.queue[tail] = observerDelivery{ctx: ctx, event: event}
-	o.size++
-	if o.running {
-		o.mu.Unlock()
+
+	l.mu.Lock()
+	if l.size == len(l.queue) {
+		l.queue[l.head] = logDelivery{}
+		l.head = (l.head + 1) % len(l.queue)
+		l.size--
+	}
+	tail := (l.head + l.size) % len(l.queue)
+	l.queue[tail] = delivery
+	l.size++
+	if l.running {
+		l.mu.Unlock()
 		return
 	}
-	o.running = true
-	o.mu.Unlock()
+	l.running = true
+	l.mu.Unlock()
 
-	go o.drain()
+	go l.drain()
 }
 
-func (o *boundedObserver) drain() {
+func (l *boundedLogger) drain() {
 	for {
-		o.mu.Lock()
-		if o.size == 0 {
-			o.running = false
-			o.mu.Unlock()
+		l.mu.Lock()
+		if l.size == 0 {
+			l.running = false
+			l.mu.Unlock()
 			return
 		}
-		delivery := o.queue[o.head]
-		o.queue[o.head] = observerDelivery{}
-		o.head = (o.head + 1) % len(o.queue)
-		o.size--
-		o.mu.Unlock()
+		delivery := l.queue[l.head]
+		l.queue[l.head] = logDelivery{}
+		l.head = (l.head + 1) % len(l.queue)
+		l.size--
+		l.mu.Unlock()
 
 		func() {
 			defer func() {
 				_ = recover()
 			}()
-			o.delegate.Observe(delivery.ctx, delivery.event)
+			l.delegate.LogAttrs(delivery.ctx, delivery.level, delivery.message, delivery.attrs...)
 		}()
 	}
 }
 
-func emitEvent(ctx context.Context, observer Observer, event Event) {
-	if observer == nil {
+func logEvent(ctx context.Context, logger Logger, level slog.Level, event string, attrs ...slog.Attr) {
+	if logger == nil {
 		return
 	}
+	eventAttrs := make([]slog.Attr, 0, len(attrs)+2)
+	eventAttrs = append(eventAttrs,
+		slog.String(logAttrEvent, event),
+		slog.Time(logAttrEventTime, time.Now()),
+	)
+	eventAttrs = append(eventAttrs, attrs...)
+
 	defer func() {
 		_ = recover()
 	}()
-	observer.Observe(ctx, event)
+	logger.LogAttrs(ctx, level, event, eventAttrs...)
 }
 
 // Snapshot is an approximate diagnostic view assembled from multiple

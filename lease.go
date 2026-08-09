@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,7 @@ var (
 	errLeaseConfirmationMissing = errors.New("redisemaphore: lease was not reconfirmed before the safety cutoff")
 )
 
-type leaseRunOptions struct {
+type permitOptions struct {
 	resource       string
 	namespace      string
 	queue          string
@@ -24,7 +25,7 @@ type leaseRunOptions struct {
 	pollInitial    time.Duration
 	pollMax        time.Duration
 	cleanupTimeout time.Duration
-	observer       Observer
+	logger         Logger
 	confirmedAt    time.Time
 	renew          func(context.Context) error
 	release        func(context.Context) (bool, error)
@@ -32,71 +33,93 @@ type leaseRunOptions struct {
 	renewRunner    *renewAttemptRunner
 }
 
-func runWithLease(ctx context.Context, opts leaseRunOptions, fn func(context.Context) error) (err error) {
+// Permit represents one renewable semaphore grant. Context is canceled if
+// ownership is lost, the acquisition context is canceled, or Release is
+// called. A Permit must be released after all protected work has stopped.
+// Copies share the same ownership lifecycle and cached Release result.
+type Permit struct {
+	state *permitState
+}
+
+type permitState struct {
+	ctx         context.Context
+	cancel      context.CancelCauseFunc
+	stopRenew   context.CancelFunc
+	renewDone   <-chan error
+	opts        permitOptions
+	releaseOnce sync.Once
+	releaseErr  error
+}
+
+// newPermit reconfirms a possibly delayed acquisition before exposing it and
+// starts renewal before returning. On failure it makes a best-effort,
+// token-safe cleanup attempt and never returns a Permit.
+func newPermit(ctx context.Context, opts permitOptions) (*Permit, error) {
 	opts.leaseLossEvent = &atomic.Bool{}
 	opts.renewRunner = &renewAttemptRunner{renew: opts.renew}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		releaseErr := releaseRunLease(opts, true)
-		return joinReleaseError(ctxErr, releaseErr)
+		releaseErr := releasePermitLease(opts, true)
+		return nil, joinReleaseError(ctxErr, releaseErr)
 	}
 
-	confirmedAt, confirmErr := confirmLeaseBeforeCallback(ctx, opts)
+	confirmedAt, confirmErr := confirmLeaseBeforeReturn(ctx, opts)
 	if confirmErr != nil {
-		releaseErr := releaseRunLease(opts, true)
-		return joinReleaseError(confirmErr, releaseErr)
+		releaseErr := releasePermitLease(opts, true)
+		return nil, joinReleaseError(confirmErr, releaseErr)
 	}
 	opts.confirmedAt = confirmedAt
 
-	leaseCtx, cancelLease := context.WithCancelCause(ctx)
+	permitCtx, cancelPermit := context.WithCancelCause(ctx)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		cancelLease(ctxErr)
-		releaseErr := releaseRunLease(opts, true)
-		return joinReleaseError(ctxErr, releaseErr)
+		cancelPermit(ctxErr)
+		releaseErr := releasePermitLease(opts, true)
+		return nil, joinReleaseError(ctxErr, releaseErr)
 	}
 
 	renewCtx, stopRenew := context.WithCancel(context.Background())
 	renewDone := make(chan error, 1)
+	permit := &Permit{
+		state: &permitState{
+			ctx:       permitCtx,
+			cancel:    cancelPermit,
+			stopRenew: stopRenew,
+			renewDone: renewDone,
+			opts:      opts,
+		},
+	}
 	go func() {
-		renewDone <- renewLease(renewCtx, cancelLease, opts)
+		renewDone <- renewLease(renewCtx, cancelPermit, opts)
 	}()
-
-	var panicValue any
-	func() {
-		defer func() {
-			panicValue = recover()
-		}()
-		err = fn(leaseCtx)
-	}()
-
-	// Cancel any child work before releasing the Redis ownership. If lease loss
-	// already supplied a more specific cause, CancelCauseFunc preserves it.
-	cancelLease(context.Canceled)
-	stopRenew()
-	renewErr := <-renewDone
-	if renewErr != nil {
-		err = errors.Join(err, renewErr)
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
-		err = errors.Join(err, ctxErr)
-	}
-
-	releaseErr := releaseRunLease(opts, false)
-	err = joinReleaseError(err, releaseErr)
-
-	if panicValue != nil {
-		panic(panicValue)
-	}
-	return err
+	return permit, nil
 }
 
-func confirmLeaseBeforeCallback(ctx context.Context, opts leaseRunOptions) (time.Time, error) {
+// Context returns the context for work protected by the permit. Its cause is
+// ErrLeaseLost when ownership can no longer be confirmed, the acquisition
+// context's cancellation cause when its parent is canceled, or context.Canceled
+// when Release cancels it first.
+func (p *Permit) Context() context.Context {
+	return p.state.ctx
+}
+
+// Release stops renewal and relinquishes Redis ownership. It is safe to call
+// concurrently or repeatedly; every call returns the same cached result.
+func (p *Permit) Release() error {
+	state := p.state
+	state.releaseOnce.Do(func() {
+		// Cancel protected work before relinquishing Redis ownership. If lease
+		// loss or the parent supplied a cause first, CancelCauseFunc preserves it.
+		state.cancel(context.Canceled)
+		state.stopRenew()
+		renewErr := <-state.renewDone
+		releaseErr := releasePermitLease(state.opts, false)
+		state.releaseErr = joinReleaseError(renewErr, releaseErr)
+	})
+	return state.releaseErr
+}
+
+func confirmLeaseBeforeReturn(ctx context.Context, opts permitOptions) (time.Time, error) {
 	confirmedAt := opts.confirmedAt
-	if confirmedAt.IsZero() {
-		// Compatibility for internal callers while they migrate to passing the
-		// command-start timestamp. A real acquisition path should always set it.
-		confirmedAt = time.Now()
-	}
-	if leaseConfirmationIsSafe(time.Now(), confirmedAt, opts.ttl) {
+	if !confirmedAt.IsZero() && leaseConfirmationIsSafe(time.Now(), confirmedAt, opts.ttl) {
 		return confirmedAt, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -114,7 +137,7 @@ func confirmLeaseBeforeCallback(ctx context.Context, opts leaseRunOptions) (time
 		if !errors.Is(err, ErrLeaseLost) {
 			emitRedisError(opts, err)
 		}
-		return time.Time{}, emitLeaseLost(opts, fmt.Errorf("reconfirm lease before callback: %w", err))
+		return time.Time{}, emitLeaseLost(opts, fmt.Errorf("reconfirm lease before return: %w", err))
 	}
 	if !leaseConfirmationIsSafe(time.Now(), attemptStarted, opts.ttl) {
 		emitLeaseRenewError(opts, errLeaseConfirmationTooOld)
@@ -125,7 +148,7 @@ func confirmLeaseBeforeCallback(ctx context.Context, opts leaseRunOptions) (time
 	return attemptStarted, nil
 }
 
-func renewLease(ctx context.Context, cancelLease context.CancelCauseFunc, opts leaseRunOptions) error {
+func renewLease(ctx context.Context, cancelLease context.CancelCauseFunc, opts permitOptions) error {
 	lastConfirmed := opts.confirmedAt
 	if lastConfirmed.IsZero() {
 		lastConfirmed = time.Now()
@@ -184,7 +207,7 @@ func renewLease(ctx context.Context, cancelLease context.CancelCauseFunc, opts l
 				reportLeaseLost(cause)
 			} else if attemptTimeout > untilLoss {
 				// Do not let one stuck Redis call consume the shutdown reserve.
-				// The local watchdog must cancel the callback at lossAt even when
+				// The local watchdog must cancel protected work at lossAt even when
 				// the client ignores context deadlines for socket I/O.
 				attemptTimeout = untilLoss
 			}
@@ -249,7 +272,7 @@ func renewLease(ctx context.Context, cancelLease context.CancelCauseFunc, opts l
 	}
 }
 
-func releaseRunLease(opts leaseRunOptions, allowMissing bool) error {
+func releasePermitLease(opts permitOptions, allowMissing bool) error {
 	releaseErr := retryTokenCleanup(
 		context.Background(),
 		opts.cleanupTimeout,
@@ -267,14 +290,13 @@ func releaseRunLease(opts leaseRunOptions, allowMissing bool) error {
 	if errors.Is(releaseErr, ErrLeaseLost) {
 		emitLeaseLost(opts, releaseErr)
 	}
-	emitEvent(context.Background(), opts.observer, Event{
-		Type:      EventRelease,
-		Resource:  opts.resource,
-		Namespace: opts.namespace,
-		Queue:     opts.queue,
-		RequestID: opts.requestID,
-		Err:       releaseErr,
-	})
+	attrs := permitLogAttrs(opts)
+	level := slog.LevelInfo
+	if releaseErr != nil {
+		level = slog.LevelError
+		attrs = append(attrs, slog.Any(logAttrError, releaseErr))
+	}
+	logEvent(context.Background(), opts.logger, level, logEventRelease, attrs...)
 	return releaseErr
 }
 
@@ -472,19 +494,13 @@ func newLeaseLostError(cause error) error {
 	return errors.Join(ErrLeaseLost, cause)
 }
 
-func emitLeaseLost(opts leaseRunOptions, cause error) error {
+func emitLeaseLost(opts permitOptions, cause error) error {
 	leaseErr := newLeaseLostError(cause)
 	if opts.leaseLossEvent != nil && !opts.leaseLossEvent.CompareAndSwap(false, true) {
 		return leaseErr
 	}
-	emitEvent(context.Background(), opts.observer, Event{
-		Type:      EventLeaseLost,
-		Resource:  opts.resource,
-		Namespace: opts.namespace,
-		Queue:     opts.queue,
-		RequestID: opts.requestID,
-		Err:       leaseErr,
-	})
+	attrs := append(permitLogAttrs(opts), slog.Any(logAttrError, leaseErr))
+	logEvent(context.Background(), opts.logger, slog.LevelError, logEventLeaseLost, attrs...)
 	return leaseErr
 }
 
@@ -495,36 +511,27 @@ func joinReleaseError(err, releaseErr error) error {
 	return errors.Join(err, fmt.Errorf("release lease: %w", releaseErr))
 }
 
-func emitLeaseRenewed(opts leaseRunOptions) {
-	emitEvent(context.Background(), opts.observer, Event{
-		Type:      EventLeaseRenewed,
-		Resource:  opts.resource,
-		Namespace: opts.namespace,
-		Queue:     opts.queue,
-		RequestID: opts.requestID,
-	})
+func emitLeaseRenewed(opts permitOptions) {
+	logEvent(context.Background(), opts.logger, slog.LevelDebug, logEventLeaseRenewed, permitLogAttrs(opts)...)
 }
 
-func emitLeaseRenewError(opts leaseRunOptions, err error) {
-	emitEvent(context.Background(), opts.observer, Event{
-		Type:      EventLeaseRenewError,
-		Resource:  opts.resource,
-		Namespace: opts.namespace,
-		Queue:     opts.queue,
-		RequestID: opts.requestID,
-		Err:       err,
-	})
+func emitLeaseRenewError(opts permitOptions, err error) {
+	attrs := append(permitLogAttrs(opts), slog.Any(logAttrError, err))
+	logEvent(context.Background(), opts.logger, slog.LevelWarn, logEventLeaseRenewError, attrs...)
 }
 
-func emitRedisError(opts leaseRunOptions, err error) {
-	emitEvent(context.Background(), opts.observer, Event{
-		Type:      EventRedisError,
-		Resource:  opts.resource,
-		Namespace: opts.namespace,
-		Queue:     opts.queue,
-		RequestID: opts.requestID,
-		Err:       err,
-	})
+func emitRedisError(opts permitOptions, err error) {
+	attrs := append(permitLogAttrs(opts), slog.Any(logAttrError, err))
+	logEvent(context.Background(), opts.logger, slog.LevelError, logEventRedisError, attrs...)
+}
+
+func permitLogAttrs(opts permitOptions) []slog.Attr {
+	return []slog.Attr{
+		slog.String(logAttrResource, opts.resource),
+		slog.String(logAttrNamespace, opts.namespace),
+		slog.String(logAttrQueue, opts.queue),
+		slog.String(logAttrRequestID, opts.requestID),
+	}
 }
 
 func growBackoff(current, maximum time.Duration) time.Duration {

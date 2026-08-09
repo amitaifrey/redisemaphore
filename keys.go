@@ -38,10 +38,6 @@ func newSemaphoreKeys(namespace string, queues []string) semaphoreKeys {
 	return keys
 }
 
-func newMutexKey(namespace string) string {
-	return fmt.Sprintf("%s:{%s}:v1:mutex", redisKeyPrefix, escapeKeyPart(namespace))
-}
-
 func escapeKeyPart(value string) string {
 	return url.PathEscape(value)
 }

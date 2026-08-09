@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -52,17 +53,17 @@ type SemaphoreConfig struct {
 	PollInitial    time.Duration
 	PollMax        time.Duration
 	CleanupTimeout time.Duration
-	Observer       Observer
+	Logger         Logger
 }
 
-// AcquireRequest identifies one attempt to run work under the semaphore.
+// AcquireRequest identifies one attempt to acquire a semaphore permit.
 // RequestID must be unique among active and waiting attempts in the namespace.
 type AcquireRequest struct {
 	Queue     string
 	RequestID string
 }
 
-// Semaphore is a renewable, callback-owned distributed semaphore.
+// Semaphore is a renewable distributed semaphore.
 type Semaphore struct {
 	redis       redis.UniversalClient
 	config      SemaphoreConfig
@@ -123,7 +124,7 @@ func NewSemaphore(client redis.UniversalClient, config SemaphoreConfig) (*Semaph
 	for index, queue := range config.QueuesByPriority {
 		queueIndex[queue] = index + 1 // Lua queue indexes are one-based.
 	}
-	config.Observer = newNonBlockingObserver(config.Observer)
+	config.Logger = newNonBlockingLogger(config.Logger)
 
 	return &Semaphore{
 		redis:       client,
@@ -134,37 +135,32 @@ func NewSemaphore(client redis.UniversalClient, config SemaphoreConfig) (*Semaph
 	}, nil
 }
 
-// Run acquires a permit, maintains its lease while fn runs, and releases it
-// after fn returns. If lease ownership becomes uncertain, fn's context is
-// canceled with ErrLeaseLost as its cause.
-func (s *Semaphore) Run(ctx context.Context, request AcquireRequest, fn func(context.Context) error) error {
+// Acquire returns a renewable permit. Callers must pass permit.Context() to
+// protected work and call permit.Release() after that work has stopped.
+func (s *Semaphore) Acquire(ctx context.Context, request AcquireRequest) (*Permit, error) {
 	if ctx == nil {
-		return invalidConfig("context must not be nil")
+		return nil, invalidConfig("context must not be nil")
 	}
 	queueIndex, ok := s.queueIndex[request.Queue]
 	if !ok {
-		return invalidConfig("queue %q is not configured", request.Queue)
+		return nil, invalidConfig("queue %q is not configured", request.Queue)
 	}
 	if strings.TrimSpace(request.RequestID) == "" {
-		return invalidConfig("request ID must not be empty")
-	}
-	if fn == nil {
-		return invalidConfig("callback must not be nil")
+		return nil, invalidConfig("request ID must not be empty")
 	}
 
 	token, err := randomSemaphoreToken()
 	if err != nil {
-		return fmt.Errorf("generate semaphore ownership token: %w", err)
+		return nil, fmt.Errorf("generate semaphore ownership token: %w", err)
 	}
 
 	started := time.Now()
-	emitEvent(ctx, s.config.Observer, Event{
-		Type:      EventAcquireStart,
-		Resource:  "semaphore",
-		Namespace: s.config.Namespace,
-		Queue:     request.Queue,
-		RequestID: request.RequestID,
-	})
+	logEvent(ctx, s.config.Logger, slog.LevelDebug, logEventAcquireStart,
+		slog.String(logAttrResource, "semaphore"),
+		slog.String(logAttrNamespace, s.config.Namespace),
+		slog.String(logAttrQueue, request.Queue),
+		slog.String(logAttrRequestID, request.RequestID),
+	)
 
 	result, err := s.acquire(ctx, request, queueIndex, token)
 	if err == nil {
@@ -175,41 +171,30 @@ func (s *Semaphore) Run(ctx context.Context, request AcquireRequest, fn func(con
 		if cleanupErr != nil {
 			err = errors.Join(err, fmt.Errorf("cancel semaphore attempt: %w", cleanupErr))
 		}
-		emitEvent(context.Background(), s.config.Observer, Event{
-			Type:         EventCleanup,
-			Resource:     "semaphore",
-			Namespace:    s.config.Namespace,
-			Queue:        request.Queue,
-			RequestID:    request.RequestID,
-			WaitDuration: time.Since(started),
-			Err:          cleanupErr,
-		})
-		emitEvent(context.Background(), s.config.Observer, Event{
-			Type:         EventAcquireFailure,
-			Resource:     "semaphore",
-			Namespace:    s.config.Namespace,
-			Queue:        request.Queue,
-			RequestID:    request.RequestID,
-			WaitDuration: time.Since(started),
-			Err:          err,
-		})
-		return err
+		cleanupLevel := slog.LevelDebug
+		if cleanupErr != nil {
+			cleanupLevel = slog.LevelError
+		}
+		logEvent(context.Background(), s.config.Logger, cleanupLevel, logEventCleanup,
+			slog.String(logAttrResource, "semaphore"),
+			slog.String(logAttrNamespace, s.config.Namespace),
+			slog.String(logAttrQueue, request.Queue),
+			slog.String(logAttrRequestID, request.RequestID),
+			slog.Duration(logAttrWaitDuration, time.Since(started)),
+			slog.Any(logAttrError, cleanupErr),
+		)
+		logEvent(context.Background(), s.config.Logger, slog.LevelWarn, logEventAcquireFailure,
+			slog.String(logAttrResource, "semaphore"),
+			slog.String(logAttrNamespace, s.config.Namespace),
+			slog.String(logAttrQueue, request.Queue),
+			slog.String(logAttrRequestID, request.RequestID),
+			slog.Duration(logAttrWaitDuration, time.Since(started)),
+			slog.Any(logAttrError, err),
+		)
+		return nil, err
 	}
 
-	emitEvent(ctx, s.config.Observer, Event{
-		Type:          EventAcquireSuccess,
-		Resource:      "semaphore",
-		Namespace:     s.config.Namespace,
-		Queue:         request.Queue,
-		RequestID:     request.RequestID,
-		WaitDuration:  time.Since(started),
-		Holders:       result.holders,
-		Waiters:       result.waiters,
-		PrunedHolders: result.prunedHolders,
-		PrunedWaiters: result.prunedWaiters,
-	})
-
-	return runWithLease(ctx, leaseRunOptions{
+	permit, err := newPermit(ctx, permitOptions{
 		resource:       "semaphore",
 		namespace:      s.config.Namespace,
 		queue:          request.Queue,
@@ -218,7 +203,7 @@ func (s *Semaphore) Run(ctx context.Context, request AcquireRequest, fn func(con
 		pollInitial:    s.config.PollInitial,
 		pollMax:        s.config.PollMax,
 		cleanupTimeout: s.config.CleanupTimeout,
-		observer:       s.config.Observer,
+		logger:         s.config.Logger,
 		confirmedAt:    result.confirmedAt,
 		renew: func(renewCtx context.Context) error {
 			return s.renew(renewCtx, token, request.RequestID)
@@ -226,7 +211,32 @@ func (s *Semaphore) Run(ctx context.Context, request AcquireRequest, fn func(con
 		release: func(releaseCtx context.Context) (bool, error) {
 			return s.release(releaseCtx, token, request.RequestID)
 		},
-	}, fn)
+	})
+	if err != nil {
+		logEvent(context.Background(), s.config.Logger, slog.LevelWarn, logEventAcquireFailure,
+			slog.String(logAttrResource, "semaphore"),
+			slog.String(logAttrNamespace, s.config.Namespace),
+			slog.String(logAttrQueue, request.Queue),
+			slog.String(logAttrRequestID, request.RequestID),
+			slog.Duration(logAttrWaitDuration, time.Since(started)),
+			slog.Any(logAttrError, err),
+		)
+		return nil, err
+	}
+
+	logEvent(ctx, s.config.Logger, slog.LevelDebug, logEventAcquireSuccess,
+		slog.String(logAttrResource, "semaphore"),
+		slog.String(logAttrNamespace, s.config.Namespace),
+		slog.String(logAttrQueue, request.Queue),
+		slog.String(logAttrRequestID, request.RequestID),
+		slog.Duration(logAttrWaitDuration, time.Since(started)),
+		slog.Int64(logAttrHolders, result.holders),
+		slog.Int64(logAttrWaiters, result.waiters),
+		slog.Int64(logAttrPrunedHolders, result.prunedHolders),
+		slog.Int64(logAttrPrunedWaiters, result.prunedWaiters),
+	)
+
+	return permit, nil
 }
 
 type acquireScriptResult struct {
@@ -255,17 +265,16 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 				return acquireScriptResult{}, ErrAcquireTimeout
 			}
 			if result.prunedHolders != 0 || result.prunedWaiters != 0 {
-				emitEvent(context.Background(), s.config.Observer, Event{
-					Type:          EventPruned,
-					Resource:      "semaphore",
-					Namespace:     s.config.Namespace,
-					Queue:         request.Queue,
-					RequestID:     request.RequestID,
-					Holders:       result.holders,
-					Waiters:       result.waiters,
-					PrunedHolders: result.prunedHolders,
-					PrunedWaiters: result.prunedWaiters,
-				})
+				logEvent(context.Background(), s.config.Logger, slog.LevelDebug, logEventPruned,
+					slog.String(logAttrResource, "semaphore"),
+					slog.String(logAttrNamespace, s.config.Namespace),
+					slog.String(logAttrQueue, request.Queue),
+					slog.String(logAttrRequestID, request.RequestID),
+					slog.Int64(logAttrHolders, result.holders),
+					slog.Int64(logAttrWaiters, result.waiters),
+					slog.Int64(logAttrPrunedHolders, result.prunedHolders),
+					slog.Int64(logAttrPrunedWaiters, result.prunedWaiters),
+				)
 			}
 			switch status {
 			case tryAcquireGranted:
@@ -290,14 +299,13 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 				// deadline until a definitive response establishes a newer one.
 				heartbeatDue = result.confirmedAt.Add(s.config.WaiterTTL / 3)
 			}
-			emitEvent(context.Background(), s.config.Observer, Event{
-				Type:      EventRedisError,
-				Resource:  "semaphore",
-				Namespace: s.config.Namespace,
-				Queue:     request.Queue,
-				RequestID: request.RequestID,
-				Err:       err,
-			})
+			logEvent(context.Background(), s.config.Logger, slog.LevelWarn, logEventRedisError,
+				slog.String(logAttrResource, "semaphore"),
+				slog.String(logAttrNamespace, s.config.Namespace),
+				slog.String(logAttrQueue, request.Queue),
+				slog.String(logAttrRequestID, request.RequestID),
+				slog.Any(logAttrError, err),
+			)
 			if isDeterministicSemaphoreError(err) {
 				return acquireScriptResult{}, err
 			}

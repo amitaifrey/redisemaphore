@@ -2,10 +2,9 @@ package redisemaphore_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,7 +53,6 @@ func integrationRedisAddrs(t *testing.T) []string {
 
 func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 	client := integrationRedisClient(t)
-	var renewals atomic.Int64
 	config := redisemaphore.SemaphoreConfig{
 		Namespace:        "integration-{braces}-" + uuid.NewString(),
 		Capacity:         1,
@@ -65,11 +63,6 @@ func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 		PollInitial:      10 * time.Millisecond,
 		PollMax:          40 * time.Millisecond,
 		CleanupTimeout:   50 * time.Millisecond,
-		Observer: redisemaphore.ObserverFunc(func(_ context.Context, event redisemaphore.Event) {
-			if event.Type == redisemaphore.EventLeaseRenewed {
-				renewals.Add(1)
-			}
-		}),
 	}
 	sem, err := redisemaphore.NewSemaphore(client, config)
 	if err != nil {
@@ -82,33 +75,40 @@ func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 	releaseHolder := make(chan struct{})
 	holderResult := make(chan error, 1)
 	go func() {
-		holderResult <- sem.Run(ctx, redisemaphore.AcquireRequest{
+		permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
 			Queue: "batch", RequestID: "holder",
-		}, func(workCtx context.Context) error {
-			close(holderStarted)
-			select {
-			case <-releaseHolder:
-				return nil
-			case <-workCtx.Done():
-				return workCtx.Err()
-			}
 		})
+		if acquireErr != nil {
+			holderResult <- acquireErr
+			return
+		}
+		close(holderStarted)
+		var workErr error
+		select {
+		case <-releaseHolder:
+		case <-permit.Context().Done():
+			workErr = context.Cause(permit.Context())
+		}
+		holderResult <- errors.Join(workErr, permit.Release())
 	}()
 	select {
 	case <-holderStarted:
 	case <-time.After(time.Second):
-		t.Fatal("holder callback did not start")
+		t.Fatal("holder did not acquire a permit")
 	}
 
 	contenderStarted := make(chan struct{})
 	contenderResult := make(chan error, 1)
 	go func() {
-		contenderResult <- sem.Run(ctx, redisemaphore.AcquireRequest{
+		permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
 			Queue: "interactive", RequestID: "contender",
-		}, func(context.Context) error {
-			close(contenderStarted)
-			return nil
 		})
+		if acquireErr != nil {
+			contenderResult <- acquireErr
+			return
+		}
+		close(contenderStarted)
+		contenderResult <- permit.Release()
 	}()
 	waitForSnapshot(t, sem, time.Second, func(snapshot redisemaphore.Snapshot) bool {
 		return snapshot.Holders == 1 && snapshot.Waiters == 1
@@ -119,16 +119,13 @@ func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 	time.Sleep(2*config.PermitTTL + 100*time.Millisecond)
 	select {
 	case <-contenderStarted:
-		t.Fatal("contender entered while renewable holder callback was still running")
+		t.Fatal("contender entered while renewable holder permit was still held")
 	default:
-	}
-	if renewals.Load() < 2 {
-		t.Fatalf("successful renewal events = %d, want at least 2", renewals.Load())
 	}
 
 	close(releaseHolder)
 	if err := receiveError(t, holderResult, time.Second); err != nil {
-		t.Fatalf("holder Run(): %v", err)
+		t.Fatalf("holder lifecycle: %v", err)
 	}
 	select {
 	case <-contenderStarted:
@@ -136,7 +133,7 @@ func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 		t.Fatal("contender did not enter after holder returned")
 	}
 	if err := receiveError(t, contenderResult, time.Second); err != nil {
-		t.Fatalf("contender Run(): %v", err)
+		t.Fatalf("contender lifecycle: %v", err)
 	}
 }
 
@@ -160,39 +157,23 @@ func TestIntegrationScriptsReloadAfterFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSemaphore(): %v", err)
 	}
-	run := func(requestID string) error {
-		return sem.Run(context.Background(), redisemaphore.AcquireRequest{
+	acquireAndRelease := func(requestID string) error {
+		permit, acquireErr := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 			Queue: "default", RequestID: requestID,
-		}, func(context.Context) error { return nil })
+		})
+		if acquireErr != nil {
+			return acquireErr
+		}
+		return permit.Release()
 	}
-	if err := run("before-flush"); err != nil {
-		t.Fatalf("Run() before SCRIPT FLUSH: %v", err)
-	}
-	mutex, err := redisemaphore.NewMutex(client, redisemaphore.MutexConfig{
-		Namespace:      "integration-script-flush-mutex-" + uuid.NewString(),
-		AcquireTimeout: 2 * time.Second,
-		LeaseTTL:       600 * time.Millisecond,
-		PollInitial:    10 * time.Millisecond,
-		PollMax:        40 * time.Millisecond,
-		CleanupTimeout: 50 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("NewMutex(): %v", err)
-	}
-	runMutex := func(requestID string) error {
-		return mutex.Run(context.Background(), requestID, func(context.Context) error { return nil })
-	}
-	if err := runMutex("before-flush"); err != nil {
-		t.Fatalf("Mutex.Run() before SCRIPT FLUSH: %v", err)
+	if err := acquireAndRelease("before-flush"); err != nil {
+		t.Fatalf("Acquire/Release before SCRIPT FLUSH: %v", err)
 	}
 	if err := client.ScriptFlush(context.Background()).Err(); err != nil {
 		t.Fatalf("SCRIPT FLUSH: %v", err)
 	}
-	if err := run("after-flush"); err != nil {
-		t.Fatalf("Run() after SCRIPT FLUSH: %v", err)
-	}
-	if err := runMutex("after-flush"); err != nil {
-		t.Fatalf("Mutex.Run() after SCRIPT FLUSH: %v", err)
+	if err := acquireAndRelease("after-flush"); err != nil {
+		t.Fatalf("Acquire/Release after SCRIPT FLUSH: %v", err)
 	}
 }
 
@@ -226,34 +207,20 @@ func TestIntegrationReadOnlyClusterRoutesOwnershipScriptsToPrimary(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewSemaphore() with ReadOnly Cluster client: %v", err)
 	}
-	err = sem.Run(context.Background(), redisemaphore.AcquireRequest{
+	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 		Queue: "default", RequestID: "read-only-semaphore",
-	}, func(workCtx context.Context) error {
-		snapshot, snapshotErr := sem.Snapshot(workCtx)
-		if snapshotErr != nil {
-			return snapshotErr
-		}
-		if snapshot.Holders != 1 {
-			return fmt.Errorf("holders in callback = %d, want 1", snapshot.Holders)
-		}
-		return nil
 	})
 	if err != nil {
-		t.Fatalf("Semaphore.Run() with ReadOnly Cluster client: %v", err)
+		t.Fatalf("Semaphore.Acquire() with ReadOnly Cluster client: %v", err)
 	}
-
-	mutex, err := redisemaphore.NewMutex(client, redisemaphore.MutexConfig{
-		Namespace:      "integration-read-only-cluster-mutex-" + uuid.NewString(),
-		AcquireTimeout: 2 * time.Second,
-		LeaseTTL:       600 * time.Millisecond,
-		PollInitial:    10 * time.Millisecond,
-		PollMax:        40 * time.Millisecond,
-		CleanupTimeout: 100 * time.Millisecond,
-	})
+	snapshot, err := sem.Snapshot(permit.Context())
 	if err != nil {
-		t.Fatalf("NewMutex() with ReadOnly Cluster client: %v", err)
+		t.Fatalf("Snapshot() with ReadOnly Cluster client: %v", err)
 	}
-	if err := mutex.Run(context.Background(), "read-only-mutex", func(context.Context) error { return nil }); err != nil {
-		t.Fatalf("Mutex.Run() with ReadOnly Cluster client: %v", err)
+	if snapshot.Holders != 1 {
+		t.Fatalf("holders while permit held = %d, want 1", snapshot.Holders)
+	}
+	if err := permit.Release(); err != nil {
+		t.Fatalf("Permit.Release() with ReadOnly Cluster client: %v", err)
 	}
 }
