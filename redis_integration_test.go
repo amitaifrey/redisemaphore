@@ -1,0 +1,284 @@
+package redisemaphore_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/amitaifrey/redisemaphore"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+)
+
+func integrationRedisClient(t *testing.T) redis.UniversalClient {
+	t.Helper()
+	addrs := integrationRedisAddrs(t)
+
+	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: addrs})
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close integration Redis client: %v", err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping integration Redis at %v: %v", addrs, err)
+	}
+	return client
+}
+
+func integrationRedisAddrs(t *testing.T) []string {
+	t.Helper()
+
+	rawAddrs := strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	if rawAddrs == "" {
+		t.Skip("set REDIS_ADDR to run real-Redis integration tests")
+	}
+	parts := strings.Split(rawAddrs, ",")
+	addrs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if addr := strings.TrimSpace(part); addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
+	if len(addrs) == 0 {
+		t.Fatal("REDIS_ADDR did not contain a usable address")
+	}
+	return addrs
+}
+
+func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
+	client := integrationRedisClient(t)
+	config := redisemaphore.SemaphoreConfig{
+		Namespace:        "integration-{braces}-" + uuid.NewString(),
+		Capacity:         1,
+		QueuesByPriority: []string{"interactive", "batch"},
+		AcquireTimeout:   3 * time.Second,
+		PermitTTL:        300 * time.Millisecond,
+		WaiterTTL:        200 * time.Millisecond,
+		PollInitial:      10 * time.Millisecond,
+		PollMax:          40 * time.Millisecond,
+		CleanupTimeout:   50 * time.Millisecond,
+	}
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	holderStarted := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderResult := make(chan error, 1)
+	go func() {
+		permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
+			Queue: "batch", RequestID: "holder",
+		})
+		if acquireErr != nil {
+			holderResult <- acquireErr
+			return
+		}
+		close(holderStarted)
+		var workErr error
+		select {
+		case <-releaseHolder:
+		case <-permit.Context().Done():
+			workErr = context.Cause(permit.Context())
+		}
+		holderResult <- errors.Join(workErr, permit.Release())
+	}()
+	select {
+	case <-holderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("holder did not acquire a permit")
+	}
+
+	contenderStarted := make(chan struct{})
+	contenderResult := make(chan error, 1)
+	go func() {
+		permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
+			Queue: "interactive", RequestID: "contender",
+		})
+		if acquireErr != nil {
+			contenderResult <- acquireErr
+			return
+		}
+		close(contenderStarted)
+		contenderResult <- permit.Release()
+	}()
+	waitForSnapshot(t, sem, time.Second, func(snapshot redisemaphore.Snapshot) bool {
+		return snapshot.Holders == 1 && snapshot.Waiters == 1
+	})
+
+	// The holder remains exclusive for more than two original permit TTLs.
+	// Without renewal the contender would enter during this interval.
+	time.Sleep(2*config.PermitTTL + 100*time.Millisecond)
+	select {
+	case <-contenderStarted:
+		t.Fatal("contender entered while renewable holder permit was still held")
+	default:
+	}
+
+	close(releaseHolder)
+	if err := receiveError(t, holderResult, time.Second); err != nil {
+		t.Fatalf("holder lifecycle: %v", err)
+	}
+	select {
+	case <-contenderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("contender did not enter after holder returned")
+	}
+	if err := receiveError(t, contenderResult, time.Second); err != nil {
+		t.Fatalf("contender lifecycle: %v", err)
+	}
+}
+
+func TestIntegrationTransactionContentionAcrossIndependentClients(t *testing.T) {
+	const (
+		capacity    = 3
+		clientCount = 6
+		workerCount = 18
+	)
+	config := redisemaphore.SemaphoreConfig{
+		Namespace:        "integration-transaction-contention-" + uuid.NewString(),
+		Capacity:         capacity,
+		QueuesByPriority: []string{"default"},
+		AcquireTimeout:   8 * time.Second,
+		PermitTTL:        3 * time.Second,
+		WaiterTTL:        time.Second,
+		PollInitial:      10 * time.Millisecond,
+		PollMax:          40 * time.Millisecond,
+		CleanupTimeout:   100 * time.Millisecond,
+	}
+
+	semaphores := make([]*redisemaphore.Semaphore, clientCount)
+	for index := range semaphores {
+		sem, err := redisemaphore.NewSemaphore(integrationRedisClient(t), config)
+		if err != nil {
+			t.Fatalf("NewSemaphore() for independent client %d: %v", index, err)
+		}
+		semaphores[index] = sem
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	capacityReached := make(chan struct{})
+	var capacityReachedOnce sync.Once
+	var active atomic.Int64
+	var maximum atomic.Int64
+	var exceeded atomic.Bool
+	results := make(chan error, workerCount)
+	var workers sync.WaitGroup
+
+	for index := 0; index < workerCount; index++ {
+		sem := semaphores[index%len(semaphores)]
+		requestID := fmt.Sprintf("contender-%02d", index)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
+				Queue: "default", RequestID: requestID,
+			})
+			if acquireErr != nil {
+				results <- acquireErr
+				return
+			}
+
+			current := active.Add(1)
+			if current > capacity {
+				exceeded.Store(true)
+			}
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			if current == capacity {
+				capacityReachedOnce.Do(func() { close(capacityReached) })
+			}
+
+			var workErr error
+			select {
+			case <-capacityReached:
+				time.Sleep(20 * time.Millisecond)
+			case <-permit.Context().Done():
+				workErr = context.Cause(permit.Context())
+			}
+			active.Add(-1)
+			results <- errors.Join(workErr, permit.Release())
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("permit lifecycle under transaction contention: %v", err)
+		}
+	}
+	if exceeded.Load() {
+		t.Fatalf("permits exceeded capacity %d; observed maximum %d", capacity, maximum.Load())
+	}
+	if got := maximum.Load(); got != capacity {
+		t.Fatalf("maximum concurrent permits = %d, want %d to prove contention was exercised", got, capacity)
+	}
+}
+
+func TestIntegrationReadOnlyClusterRoutesOwnershipTransactionsToPrimary(t *testing.T) {
+	addrs := integrationRedisAddrs(t)
+	if len(addrs) < 6 {
+		t.Skip("requires the six-node Redis Cluster integration job with replicas")
+	}
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:    addrs,
+		ReadOnly: true,
+	})
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close read-only Cluster client: %v", err)
+		}
+	})
+
+	config := redisemaphore.SemaphoreConfig{
+		Namespace:        "integration-read-only-cluster-" + uuid.NewString(),
+		Capacity:         1,
+		QueuesByPriority: []string{"default"},
+		AcquireTimeout:   2 * time.Second,
+		PermitTTL:        600 * time.Millisecond,
+		WaiterTTL:        300 * time.Millisecond,
+		PollInitial:      10 * time.Millisecond,
+		PollMax:          40 * time.Millisecond,
+		CleanupTimeout:   100 * time.Millisecond,
+	}
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore() with ReadOnly Cluster client: %v", err)
+	}
+	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "read-only-semaphore",
+	})
+	if err != nil {
+		t.Fatalf("Semaphore.Acquire() with ReadOnly Cluster client: %v", err)
+	}
+	snapshot, err := sem.Snapshot(permit.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() with ReadOnly Cluster client: %v", err)
+	}
+	if snapshot.Holders != 1 {
+		t.Fatalf("holders while permit held = %d, want 1", snapshot.Holders)
+	}
+	if err := permit.Release(); err != nil {
+		t.Fatalf("Permit.Release() with ReadOnly Cluster client: %v", err)
+	}
+}

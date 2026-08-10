@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit, repeat, race, and vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+      - name: Repeat concurrency-sensitive tests
+        run: go test -shuffle=on -count=20 ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+
+  redis-integration:
+    name: Redis ${{ matrix.redis-version }} integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        redis-version: [7-alpine, 8-alpine]
+    services:
+      redis:
+        image: redis:${{ matrix.redis-version }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests against real Redis
+        run: go test ./... -run Integration -count=1
+
+  redis-cluster-integration:
+    name: Redis 7 Cluster integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REDIS_ADDR: 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start six Redis Cluster nodes (three primaries and three replicas)
+        run: |
+          for port in 7000 7001 7002 7003 7004 7005; do
+            docker run -d --name "redis-${port}" --network host redis:7-alpine \
+              redis-server \
+              --port "${port}" \
+              --cluster-enabled yes \
+              --cluster-config-file "nodes-${port}.conf" \
+              --cluster-node-timeout 5000 \
+              --cluster-announce-ip 127.0.0.1 \
+              --cluster-announce-port "${port}" \
+              --cluster-announce-bus-port "$((port + 10000))" \
+              --appendonly no \
+              --protected-mode no
+          done
+          for port in 7000 7001 7002 7003 7004 7005; do
+            for attempt in $(seq 1 20); do
+              if docker exec "redis-${port}" redis-cli -p "${port}" ping; then
+                break
+              fi
+              sleep 1
+            done
+          done
+          docker run --rm --network host redis:7-alpine redis-cli --cluster create \
+            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
+            127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 \
+            --cluster-replicas 1 --cluster-yes
+      - name: Run cluster integration tests
+        run: go test ./... -run Integration -count=1
