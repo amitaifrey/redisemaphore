@@ -357,12 +357,12 @@ func retryTokenCleanup(
 		if !isRetryableRedisOperationError(err) {
 			return err
 		}
-		// A completed retryable transport/context error may mean the command
-		// committed but its acknowledgement was lost. An explicit Redis error
-		// reply is definitive non-execution. Merely reaching our local wait
-		// deadline establishes neither: the single in-flight command may later
-		// return a definitive missing-token result, which must report lease loss.
-		if completed && !isRedisServerError(err) {
+		// Only MULTI/EXEC errors tagged at the state commit boundary are
+		// ambiguous. Raw transport errors can now come from gate acquisition or
+		// pre-EXEC reads, where the semaphore state definitely did not commit.
+		// Merely reaching our local wait deadline establishes neither: the one
+		// in-flight attempt may later return a definitive result.
+		if completed && transactionOutcomeUncertain(err) {
 			ambiguous = true
 		}
 		if overallErr := overallCtx.Err(); overallErr != nil {

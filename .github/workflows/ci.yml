@@ -44,7 +44,6 @@ jobs:
           --health-retries 10
     env:
       REDIS_ADDR: 127.0.0.1:6379
-      REDIS_ALLOW_SCRIPT_FLUSH: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -60,7 +59,6 @@ jobs:
     timeout-minutes: 10
     env:
       REDIS_ADDR: 127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005
-      REDIS_ALLOW_SCRIPT_FLUSH: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

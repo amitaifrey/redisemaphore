@@ -26,17 +26,7 @@ const (
 	cleanupBatchSize      = 128
 )
 
-var errInvalidSemaphoreScriptResponse = errors.New("redisemaphore: invalid semaphore script response")
-
-var (
-	tryAcquireRedisScript       = redis.NewScript(tryAcquireScript)
-	renewSemaphoreRedisScript   = redis.NewScript(renewSemaphoreScript)
-	releaseSemaphoreRedisScript = redis.NewScript(releaseSemaphoreScript)
-	cancelSemaphoreRedisScript  = redis.NewScript(cancelSemaphoreScript)
-	snapshotLeasesRedisScript   = redis.NewScript(snapshotLeasesScript)
-	snapshotWaitersRedisScript  = redis.NewScript(snapshotWaitersScript)
-	snapshotMetadataRedisScript = redis.NewScript(snapshotMetadataScript)
-)
+var errInvalidSemaphoreState = errors.New("redisemaphore: invalid semaphore state")
 
 // SemaphoreConfig configures a renewable, priority-aware distributed
 // semaphore. Capacity, queue order, and lease durations are immutable for a
@@ -104,35 +94,66 @@ func NewSemaphore(client redis.UniversalClient, config SemaphoreConfig) (*Semaph
 	}
 
 	keys := newSemaphoreKeys(config.Namespace, config.QueuesByPriority)
-	storedValue, err := client.Eval(checkCtx, initializeSemaphoreScript, []string{keys.config}, string(fingerprint)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("initialize semaphore configuration: %w", err)
-	}
-	stored, ok := storedValue.(string)
-	if !ok {
-		if storedBytes, bytesOK := storedValue.([]byte); bytesOK {
-			stored = string(storedBytes)
-		} else {
-			return nil, fmt.Errorf("unexpected semaphore configuration result %T", storedValue)
-		}
-	}
-	if stored != string(fingerprint) {
-		return nil, invalidConfig("namespace %q is already configured differently", config.Namespace)
-	}
-
-	queueIndex := make(map[string]int, len(config.QueuesByPriority))
-	for index, queue := range config.QueuesByPriority {
-		queueIndex[queue] = index + 1 // Lua queue indexes are one-based.
-	}
-	config.Logger = newNonBlockingLogger(config.Logger)
-
-	return &Semaphore{
+	semaphore := &Semaphore{
 		redis:       client,
 		config:      config,
 		keys:        keys,
 		fingerprint: string(fingerprint),
-		queueIndex:  queueIndex,
-	}, nil
+	}
+	if err := semaphore.initializeConfiguration(checkCtx); err != nil {
+		return nil, err
+	}
+
+	queueIndex := make(map[string]int, len(config.QueuesByPriority))
+	for index, queue := range config.QueuesByPriority {
+		queueIndex[queue] = index + 1
+	}
+	config.Logger = newNonBlockingLogger(config.Logger)
+	semaphore.config = config
+	semaphore.queueIndex = queueIndex
+	return semaphore, nil
+}
+
+func (s *Semaphore) initializeConfiguration(ctx context.Context) error {
+	for {
+		_, err := withOperationGate(ctx, s, []string{s.keys.config}, false, func(tx *redis.Tx, _ operationGate) (struct{}, error) {
+			stored, getErr := tx.Get(ctx, s.keys.config).Result()
+			switch {
+			case errors.Is(getErr, redis.Nil):
+				return struct{}{}, execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+					pipe.Set(ctx, s.keys.config, s.fingerprint, 0)
+				})
+			case getErr != nil:
+				return struct{}{}, getErr
+			case stored != s.fingerprint:
+				if err := validateWatchedState(ctx, tx, s.keys.operationGate); err != nil {
+					return struct{}{}, err
+				}
+				return struct{}{}, invalidConfig("namespace %q is already configured differently", s.config.Namespace)
+			default:
+				return struct{}{}, validateWatchedState(ctx, tx, s.keys.operationGate)
+			}
+		})
+		if err == nil {
+			return nil
+		}
+		if !transactionOutcomeUncertain(err) &&
+			!errors.Is(err, errOperationGateBusy) &&
+			!errors.Is(err, errOperationGateLost) &&
+			!errors.Is(err, redis.TxFailedErr) {
+			return fmt.Errorf("initialize semaphore configuration: %w", err)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("initialize semaphore configuration: %w", errors.Join(err, ctx.Err()))
+		}
+		timer := time.NewTimer(jitter(s.config.PollInitial))
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return fmt.Errorf("initialize semaphore configuration: %w", errors.Join(err, ctx.Err()))
+		case <-timer.C:
+		}
+	}
 }
 
 // Acquire returns a renewable permit. Callers must pass permit.Context() to
@@ -239,7 +260,7 @@ func (s *Semaphore) Acquire(ctx context.Context, request AcquireRequest) (*Permi
 	return permit, nil
 }
 
-type acquireScriptResult struct {
+type acquireResult struct {
 	confirmedAt   time.Time
 	holders       int64
 	waiters       int64
@@ -247,7 +268,7 @@ type acquireScriptResult struct {
 	prunedWaiters int64
 }
 
-func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIndex int, token string) (acquireScriptResult, error) {
+func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIndex int, token string) (acquireResult, error) {
 	acquireCtx, cancel := context.WithTimeout(ctx, s.config.AcquireTimeout)
 	defer cancel()
 
@@ -260,9 +281,9 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 			lastErr = nil
 			if acquireCtx.Err() != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					return acquireScriptResult{}, ctxErr
+					return acquireResult{}, ctxErr
 				}
-				return acquireScriptResult{}, ErrAcquireTimeout
+				return acquireResult{}, ErrAcquireTimeout
 			}
 			if result.prunedHolders != 0 || result.prunedWaiters != 0 {
 				logEvent(context.Background(), s.config.Logger, slog.LevelDebug, logEventPruned,
@@ -284,17 +305,17 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 				// after the randomized backoff below.
 				heartbeatDue = result.confirmedAt.Add(s.config.WaiterTTL / 3)
 			case tryAcquireDuplicate:
-				return acquireScriptResult{}, ErrDuplicateRequest
+				return acquireResult{}, ErrDuplicateRequest
 			case tryAcquireTokenConflict:
-				return acquireScriptResult{}, fmt.Errorf("semaphore ownership token conflict")
+				return acquireResult{}, fmt.Errorf("semaphore ownership token conflict")
 			case tryAcquireConfigMismatch:
-				return acquireScriptResult{}, invalidConfig("persisted configuration for namespace %q changed", s.config.Namespace)
+				return acquireResult{}, invalidConfig("persisted configuration for namespace %q changed", s.config.Namespace)
 			default:
-				return acquireScriptResult{}, fmt.Errorf("%w: unknown try-acquire status %d", errInvalidSemaphoreScriptResponse, status)
+				return acquireResult{}, fmt.Errorf("%w: unknown try-acquire status %d", errInvalidSemaphoreState, status)
 			}
 		} else {
 			if heartbeatDue.IsZero() && !result.confirmedAt.IsZero() {
-				// The script may have registered or refreshed this waiter even
+				// The transaction may have registered or refreshed this waiter even
 				// though its reply was lost. Retry by the conservative heartbeat
 				// deadline until a definitive response establishes a newer one.
 				heartbeatDue = result.confirmedAt.Add(s.config.WaiterTTL / 3)
@@ -307,9 +328,9 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 				slog.Any(logAttrError, err),
 			)
 			if isDeterministicSemaphoreError(err) {
-				return acquireScriptResult{}, err
+				return acquireResult{}, err
 			}
-			// The script may have committed before a response was lost. Retrying
+			// The transaction may have committed before a response was lost. Retrying
 			// with the same token is therefore required for correctness.
 			lastErr = err
 		}
@@ -340,7 +361,7 @@ func (s *Semaphore) acquire(ctx context.Context, request AcquireRequest, queueIn
 			if lastErr != nil {
 				terminalErr = errors.Join(terminalErr, lastErr)
 			}
-			return acquireScriptResult{}, terminalErr
+			return acquireResult{}, terminalErr
 		case <-timer.C:
 		}
 		backoff = growBackoff(backoff, s.config.PollMax)
@@ -355,114 +376,439 @@ const (
 	tryAcquireConfigMismatch int64 = -3
 )
 
-func (s *Semaphore) tryAcquire(ctx context.Context, request AcquireRequest, queueIndex int, token string) (acquireScriptResult, int64, error) {
-	keys := make([]string, 0, 8+len(s.keys.queues))
-	keys = append(keys,
-		s.keys.config,
-		s.keys.holders,
-		s.keys.waiters,
-		s.keys.waiterStarted,
-		s.keys.tokenQueue,
-		s.keys.tokenRequest,
-		s.keys.activeRequest,
-		s.keys.sequence,
-	)
-	keys = append(keys, s.keys.queues...)
+type acquireAttemptResult struct {
+	result acquireResult
+	status int64
+}
 
-	confirmedAt := time.Now()
-	value, err := tryAcquireRedisScript.Run(ctx, s.redis, keys,
-		s.fingerprint,
-		token,
-		request.RequestID,
-		queueIndex,
-		s.config.Capacity,
-		s.config.WaiterTTL.Milliseconds(),
-		s.config.PermitTTL.Milliseconds(),
-		cleanupBatchSize,
-	).Result()
+func (s *Semaphore) tryAcquire(ctx context.Context, request AcquireRequest, queueIndex int, token string) (acquireResult, int64, error) {
+	attemptStarted := time.Now()
+	attempt, err := withOperationGate(ctx, s, s.stateKeys(), false, func(tx *redis.Tx, gate operationGate) (acquireAttemptResult, error) {
+		stored, getErr := tx.Get(ctx, s.keys.config).Result()
+		if getErr != nil && !errors.Is(getErr, redis.Nil) {
+			return acquireAttemptResult{}, getErr
+		}
+		if errors.Is(getErr, redis.Nil) || stored != s.fingerprint {
+			if err := validateWatchedState(ctx, tx, s.keys.operationGate); err != nil {
+				return acquireAttemptResult{}, err
+			}
+			return acquireAttemptResult{status: tryAcquireConfigMismatch}, nil
+		}
+
+		initialNow, timeErr := tx.Time(ctx).Result()
+		if timeErr != nil {
+			return acquireAttemptResult{}, timeErr
+		}
+		initialNowMillis := initialNow.UnixMilli()
+		maximum := strconv.FormatInt(initialNowMillis, 10)
+		var expiredHolderCommand, expiredWaiterCommand *redis.StringSliceCmd
+		_, readErr := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			expiredHolderCommand = pipe.ZRangeByScore(ctx, s.keys.holders, &redis.ZRangeBy{
+				Min: "-inf", Max: maximum, Offset: 0, Count: cleanupBatchSize,
+			})
+			expiredWaiterCommand = pipe.ZRangeByScore(ctx, s.keys.waiters, &redis.ZRangeBy{
+				Min: "-inf", Max: maximum, Offset: 0, Count: cleanupBatchSize,
+			})
+			return nil
+		})
+		if readErr != nil {
+			return acquireAttemptResult{}, readErr
+		}
+		expiredHolders, readErr := expiredHolderCommand.Result()
+		if readErr != nil {
+			return acquireAttemptResult{}, readErr
+		}
+		expiredWaiters, readErr := expiredWaiterCommand.Result()
+		if readErr != nil {
+			return acquireAttemptResult{}, readErr
+		}
+
+		mappedToken, mapped, readErr := optionalHGet(ctx, tx, s.keys.activeRequest, request.RequestID)
+		if readErr != nil {
+			return acquireAttemptResult{}, readErr
+		}
+		stateTokens := make([]string, 0, len(expiredHolders)+len(expiredWaiters)+2)
+		stateTokens = append(stateTokens, expiredHolders...)
+		remainingCleanup := cleanupBatchSize - len(expiredHolders)
+		if remainingCleanup > 0 {
+			if len(expiredWaiters) > remainingCleanup {
+				expiredWaiters = expiredWaiters[:remainingCleanup]
+			}
+			stateTokens = append(stateTokens, expiredWaiters...)
+		} else {
+			expiredWaiters = nil
+		}
+		if mapped {
+			stateTokens = append(stateTokens, mappedToken)
+		}
+		stateTokens = append(stateTokens, token)
+		states, readErr := loadTokenStates(ctx, tx, s.keys, stateTokens)
+		if readErr != nil {
+			return acquireAttemptResult{}, readErr
+		}
+
+		removals := make(map[string]*tokenRemoval)
+		var prunedHolders, prunedWaiters int64
+		cleaned := 0
+		scheduleRemoval := func(state semaphoreTokenState, extraQueue int) {
+			if _, exists := removals[state.token]; !exists {
+				if state.hasHolder {
+					prunedHolders++
+				}
+				if state.hasWaiter {
+					prunedWaiters++
+				}
+			}
+			addTokenRemoval(removals, state, extraQueue)
+		}
+		for _, candidate := range expiredHolders {
+			scheduleRemoval(states[candidate], 0)
+			cleaned++
+		}
+		for _, candidate := range expiredWaiters {
+			scheduleRemoval(states[candidate], 0)
+			cleaned++
+		}
+
+		leaseClockStarted := time.Now()
+		currentNow, timeErr := tx.Time(ctx).Result()
+		if timeErr != nil {
+			return acquireAttemptResult{}, timeErr
+		}
+		remainingGate, ttlErr := tx.PTTL(ctx, s.keys.operationGate).Result()
+		if ttlErr != nil {
+			return acquireAttemptResult{}, ttlErr
+		}
+		if remainingGate <= 0 {
+			return acquireAttemptResult{}, errOperationGateLost
+		}
+		nowMillis := currentNow.UnixMilli()
+		safeUntil := nowMillis + remainingGate.Milliseconds()
+
+		commitRemovals := func() error {
+			if len(removals) == 0 {
+				return validateWatchedState(ctx, tx, s.keys.operationGate)
+			}
+			return execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+				queueTokenRemovals(ctx, pipe, s.keys, removals)
+			})
+		}
+
+		if mapped && mappedToken != token {
+			mappedState := states[mappedToken]
+			if (mappedState.hasHolder && mappedState.holderExpiry > nowMillis) ||
+				(mappedState.hasWaiter && mappedState.waiterExpiry > nowMillis) {
+				if err := commitRemovals(); err != nil {
+					return acquireAttemptResult{}, err
+				}
+				return acquireAttemptResult{
+					result: acquireResult{prunedHolders: prunedHolders, prunedWaiters: prunedWaiters},
+					status: tryAcquireDuplicate,
+				}, nil
+			}
+			scheduleRemoval(mappedState, 0)
+			mapped = false
+		}
+
+		ownState := states[token]
+		if ownState.hasRequest && ownState.requestID != request.RequestID {
+			if err := commitRemovals(); err != nil {
+				return acquireAttemptResult{}, err
+			}
+			return acquireAttemptResult{
+				result: acquireResult{prunedHolders: prunedHolders, prunedWaiters: prunedWaiters},
+				status: tryAcquireTokenConflict,
+			}, nil
+		}
+
+		if ownState.hasHolder && ownState.holderExpiry > nowMillis {
+			if ownState.holderExpiry <= safeUntil || !ownState.hasRequest || ownState.requestID != request.RequestID || !ownState.activeMatches {
+				if err := commitRemovals(); err != nil {
+					return acquireAttemptResult{}, err
+				}
+				return acquireAttemptResult{}, ErrLeaseLost
+			}
+			holders, countErr := tx.ZCount(ctx, s.keys.holders, "("+strconv.FormatInt(nowMillis, 10), "+inf").Result()
+			if countErr != nil {
+				return acquireAttemptResult{}, countErr
+			}
+			waiters, countErr := tx.ZCount(ctx, s.keys.waiters, "("+strconv.FormatInt(nowMillis, 10), "+inf").Result()
+			if countErr != nil {
+				return acquireAttemptResult{}, countErr
+			}
+			err := execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+				queueTokenRemovals(ctx, pipe, s.keys, removals)
+				pipe.ZAddArgs(ctx, s.keys.holders, redis.ZAddArgs{
+					XX:      true,
+					Members: []redis.Z{{Score: float64(nowMillis + s.config.PermitTTL.Milliseconds()), Member: token}},
+				})
+			})
+			if err != nil {
+				return acquireAttemptResult{}, err
+			}
+			return acquireAttemptResult{
+				result: acquireResult{confirmedAt: leaseClockStarted, holders: holders, waiters: waiters, prunedHolders: prunedHolders, prunedWaiters: prunedWaiters},
+				status: tryAcquireGranted,
+			}, nil
+		}
+		if ownState.hasHolder {
+			scheduleRemoval(ownState, 0)
+			ownState = semaphoreTokenState{token: token}
+			mapped = false
+		}
+
+		waiterConsistent := ownState.hasWaiter && ownState.waiterExpiry > safeUntil &&
+			ownState.hasRequest && ownState.requestID == request.RequestID &&
+			ownState.activeMatches && ownState.hasQueue && ownState.queueIndex == queueIndex && mapped && mappedToken == token
+		registerWaiter := !waiterConsistent
+		if registerWaiter && (ownState.hasWaiter || ownState.hasRequest || (mapped && mappedToken == token)) {
+			scheduleRemoval(ownState, 0)
+		}
+
+		holders, countErr := tx.ZCount(ctx, s.keys.holders, "("+strconv.FormatInt(nowMillis, 10), "+inf").Result()
+		if countErr != nil {
+			return acquireAttemptResult{}, countErr
+		}
+		waiters, countErr := tx.ZCount(ctx, s.keys.waiters, "("+strconv.FormatInt(nowMillis, 10), "+inf").Result()
+		if countErr != nil {
+			return acquireAttemptResult{}, countErr
+		}
+		storedHolders, countErr := tx.ZCard(ctx, s.keys.holders).Result()
+		if countErr != nil {
+			return acquireAttemptResult{}, countErr
+		}
+		availableStoredHolders := storedHolders
+		for _, removal := range removals {
+			if removal.state.hasHolder && availableStoredHolders > 0 {
+				availableStoredHolders--
+			}
+		}
+
+		var selected string
+		if availableStoredHolders < int64(s.config.Capacity) {
+			queueReadLimit := int64(len(removals) + (cleanupBatchSize - cleaned) + 1)
+			queueCandidates, readErr := readQueueCandidates(ctx, tx, s.keys, queueReadLimit)
+			if readErr != nil {
+				return acquireAttemptResult{}, readErr
+			}
+			cleanupBlocked := false
+			type staleQueueToken struct {
+				token      string
+				queueIndex int
+			}
+			staleQueueTokens := make([]staleQueueToken, 0)
+			for index, candidates := range queueCandidates {
+				for _, candidate := range candidates {
+					if _, removed := removals[candidate.token]; removed {
+						continue
+					}
+					if candidate.expiry <= nowMillis {
+						if cleaned >= cleanupBatchSize {
+							cleanupBlocked = true
+							break
+						}
+						staleQueueTokens = append(staleQueueTokens, staleQueueToken{token: candidate.token, queueIndex: index + 1})
+						cleaned++
+						continue
+					}
+					if candidate.expiry <= safeUntil {
+						cleanupBlocked = true
+						break
+					}
+					selected = candidate.token
+					break
+				}
+				if selected != "" || cleanupBlocked {
+					break
+				}
+				if registerWaiter && index+1 == queueIndex {
+					selected = token
+					break
+				}
+			}
+			if len(staleQueueTokens) != 0 {
+				tokens := make([]string, len(staleQueueTokens))
+				for index := range staleQueueTokens {
+					tokens[index] = staleQueueTokens[index].token
+				}
+				staleStates, stateErr := loadTokenStates(ctx, tx, s.keys, tokens)
+				if stateErr != nil {
+					return acquireAttemptResult{}, stateErr
+				}
+				for _, stale := range staleQueueTokens {
+					scheduleRemoval(staleStates[stale.token], stale.queueIndex)
+					if !staleStates[stale.token].hasWaiter {
+						prunedWaiters++
+					}
+				}
+			}
+		}
+
+		for _, removal := range removals {
+			if removal.state.holderExpiry > nowMillis && holders > 0 {
+				holders--
+			}
+			if removal.state.hasHolder && storedHolders > 0 {
+				storedHolders--
+			}
+			if removal.state.waiterExpiry > nowMillis && waiters > 0 {
+				waiters--
+			}
+		}
+		grant := storedHolders < int64(s.config.Capacity) && selected == token
+		var nextSequence int64
+		if registerWaiter {
+			storedSequence, sequenceErr := tx.Get(ctx, s.keys.sequence).Result()
+			if errors.Is(sequenceErr, redis.Nil) {
+				nextSequence = 1
+			} else if sequenceErr != nil {
+				return acquireAttemptResult{}, sequenceErr
+			} else {
+				parsed, parseErr := strconv.ParseInt(storedSequence, 10, 64)
+				if parseErr != nil || parsed < 0 || parsed >= 1<<53-1 {
+					return acquireAttemptResult{}, fmt.Errorf("%w: invalid queue sequence %q", errInvalidSemaphoreState, storedSequence)
+				}
+				nextSequence = parsed + 1
+			}
+		}
+
+		err := execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+			queueTokenRemovals(ctx, pipe, s.keys, removals)
+			if registerWaiter {
+				pipe.Set(ctx, s.keys.sequence, nextSequence, 0)
+				pipe.HSet(ctx, s.keys.activeRequest, request.RequestID, token)
+				pipe.HSet(ctx, s.keys.tokenRequest, token, request.RequestID)
+				pipe.HSet(ctx, s.keys.tokenQueue, token, queueIndex)
+				if !grant {
+					pipe.HSet(ctx, s.keys.waiterStarted, token, nowMillis)
+					pipe.ZAdd(ctx, s.keys.waiters, redis.Z{Score: float64(nowMillis + s.config.WaiterTTL.Milliseconds()), Member: token})
+					pipe.ZAdd(ctx, s.keys.queues[queueIndex-1], redis.Z{Score: float64(nextSequence), Member: token})
+				}
+			} else if !grant {
+				pipe.ZAddArgs(ctx, s.keys.waiters, redis.ZAddArgs{
+					XX:      true,
+					Members: []redis.Z{{Score: float64(nowMillis + s.config.WaiterTTL.Milliseconds()), Member: token}},
+				})
+			}
+			if grant {
+				pipe.ZRem(ctx, s.keys.waiters, token)
+				pipe.ZRem(ctx, s.keys.queues[queueIndex-1], token)
+				pipe.HDel(ctx, s.keys.waiterStarted, token)
+				pipe.ZAdd(ctx, s.keys.holders, redis.Z{Score: float64(nowMillis + s.config.PermitTTL.Milliseconds()), Member: token})
+			}
+		})
+		if err != nil {
+			return acquireAttemptResult{}, err
+		}
+		if grant {
+			holders++
+			if !registerWaiter && waiters > 0 {
+				waiters--
+			}
+		} else if registerWaiter {
+			waiters++
+		}
+		status := tryAcquireWaiting
+		if grant {
+			status = tryAcquireGranted
+		}
+		return acquireAttemptResult{
+			result: acquireResult{confirmedAt: leaseClockStarted, holders: holders, waiters: waiters, prunedHolders: prunedHolders, prunedWaiters: prunedWaiters},
+			status: status,
+		}, nil
+	})
 	if err != nil {
-		return acquireScriptResult{confirmedAt: confirmedAt}, 0, err
+		return acquireResult{confirmedAt: attemptStarted}, 0, err
 	}
-	values, ok := value.([]interface{})
-	if !ok || len(values) != 5 {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: unexpected try-acquire result %T: %v", errInvalidSemaphoreScriptResponse, value, value)
-	}
-	status, err := scriptInt(values[0])
-	if err != nil {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	holders, err := scriptInt(values[1])
-	if err != nil {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	waiters, err := scriptInt(values[2])
-	if err != nil {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	prunedHolders, err := scriptInt(values[3])
-	if err != nil {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	prunedWaiters, err := scriptInt(values[4])
-	if err != nil {
-		return acquireScriptResult{}, 0, fmt.Errorf("%w: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	return acquireScriptResult{
-		confirmedAt:   confirmedAt,
-		holders:       holders,
-		waiters:       waiters,
-		prunedHolders: prunedHolders,
-		prunedWaiters: prunedWaiters,
-	}, status, nil
+	return attempt.result, attempt.status, nil
 }
 
 func (s *Semaphore) renew(ctx context.Context, token, requestID string) error {
-	value, err := renewSemaphoreRedisScript.Run(ctx, s.redis, []string{
-		s.keys.holders,
-		s.keys.tokenRequest,
-		s.keys.activeRequest,
-	}, token, requestID, s.config.PermitTTL.Milliseconds()).Result()
-	if err != nil {
-		return err
-	}
-	owned, err := scriptInt(value)
-	if err != nil {
-		return fmt.Errorf("%w: renew semaphore: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	if owned != 1 {
-		return ErrLeaseLost
-	}
-	return nil
+	_, err := withOperationGate(ctx, s, []string{s.keys.holders, s.keys.waiters, s.keys.tokenQueue, s.keys.tokenRequest, s.keys.activeRequest}, true, func(tx *redis.Tx, _ operationGate) (struct{}, error) {
+		states, readErr := loadTokenStates(ctx, tx, s.keys, []string{token})
+		if readErr != nil {
+			return struct{}{}, readErr
+		}
+		state := states[token]
+		now, timeErr := tx.Time(ctx).Result()
+		if timeErr != nil {
+			return struct{}{}, timeErr
+		}
+		remaining, ttlErr := tx.PTTL(ctx, s.keys.operationGate).Result()
+		if ttlErr != nil {
+			return struct{}{}, ttlErr
+		}
+		if !state.hasRequest || state.requestID != requestID || !state.activeMatches ||
+			state.holderExpiry <= now.UnixMilli()+remaining.Milliseconds() {
+			if err := validateWatchedState(ctx, tx, s.keys.operationGate); err != nil {
+				return struct{}{}, err
+			}
+			return struct{}{}, ErrLeaseLost
+		}
+		err := execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+			pipe.ZAddArgs(ctx, s.keys.holders, redis.ZAddArgs{
+				XX:      true,
+				Members: []redis.Z{{Score: float64(now.UnixMilli() + s.config.PermitTTL.Milliseconds()), Member: token}},
+			})
+		})
+		return struct{}{}, err
+	})
+	return err
 }
 
 func (s *Semaphore) release(ctx context.Context, token, requestID string) (bool, error) {
-	keys := s.cleanupKeys()
-	value, err := releaseSemaphoreRedisScript.Run(ctx, s.redis, keys, token, requestID).Result()
-	if err != nil {
-		return false, fmt.Errorf("release semaphore token: %w", err)
-	}
-	matched, err := scriptInt(value)
-	if err != nil {
-		return false, fmt.Errorf("%w: release semaphore token: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	return matched == 1, nil
+	return s.cleanupToken(ctx, token, requestID, true)
 }
 
 func (s *Semaphore) cancel(ctx context.Context, token, requestID string) (bool, error) {
-	keys := s.cleanupKeys()
-	value, err := cancelSemaphoreRedisScript.Run(ctx, s.redis, keys, token, requestID).Result()
+	return s.cleanupToken(ctx, token, requestID, false)
+}
+
+func (s *Semaphore) cleanupToken(ctx context.Context, token, requestID string, requireLiveHolder bool) (bool, error) {
+	matched, err := withOperationGate(ctx, s, s.cleanupKeys(), true, func(tx *redis.Tx, gate operationGate) (bool, error) {
+		states, readErr := loadTokenStates(ctx, tx, s.keys, []string{token})
+		if readErr != nil {
+			return false, readErr
+		}
+		state := states[token]
+		if !state.hasRequest || state.requestID != requestID {
+			if err := validateWatchedState(ctx, tx, s.keys.operationGate); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		matched := state.hasHolder || state.hasWaiter
+		if requireLiveHolder {
+			now, timeErr := tx.Time(ctx).Result()
+			if timeErr != nil {
+				return false, timeErr
+			}
+			matched = state.hasHolder &&
+				state.holderExpiry > now.UnixMilli()+gate.ttl.Milliseconds() &&
+				state.activeMatches
+		}
+		removals := map[string]*tokenRemoval{}
+		addTokenRemoval(removals, state, 0)
+		err := execWatchedTransaction(ctx, tx, func(pipe redis.Pipeliner) {
+			queueTokenRemovals(ctx, pipe, s.keys, removals)
+		})
+		return matched, err
+	})
 	if err != nil {
-		return false, fmt.Errorf("cancel semaphore token: %w", err)
+		return false, fmt.Errorf("clean up semaphore token: %w", err)
 	}
-	removed, err := scriptInt(value)
-	if err != nil {
-		return false, fmt.Errorf("%w: cancel semaphore token: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	return removed > 0, nil
+	return matched, nil
 }
 
 func isDeterministicSemaphoreError(err error) bool {
-	return errors.Is(err, errInvalidSemaphoreScriptResponse) ||
+	if transactionOutcomeUncertain(err) ||
+		errors.Is(err, redis.TxFailedErr) ||
+		errors.Is(err, errOperationGateBusy) ||
+		errors.Is(err, errOperationGateLost) {
+		return false
+	}
+	return errors.Is(err, errInvalidSemaphoreState) ||
+		errors.Is(err, ErrLeaseLost) ||
 		errors.Is(err, redis.Nil) ||
 		errors.Is(err, redis.ErrClosed) ||
 		(isRedisServerError(err) && !isRetryableRedisServerError(err))
@@ -494,159 +840,144 @@ func (s *Semaphore) cleanupKeys() []string {
 	return append(keys, s.keys.queues...)
 }
 
+func (s *Semaphore) stateKeys() []string {
+	keys := make([]string, 0, 8+len(s.keys.queues))
+	keys = append(keys,
+		s.keys.config,
+		s.keys.sequence,
+		s.keys.holders,
+		s.keys.waiters,
+		s.keys.waiterStarted,
+		s.keys.tokenQueue,
+		s.keys.tokenRequest,
+		s.keys.activeRequest,
+	)
+	return append(keys, s.keys.queues...)
+}
+
 // Snapshot returns a read-only diagnostic view using one sampled Redis server
 // timestamp. It is intentionally a diagnostic multi-call: state can change
 // between calls, and total work is proportional to stored waiter records.
-// Waiter metadata is requested in scan batches so one call does not assemble
-// the entire waiter set in Lua or retain it in client memory.
+// Waiter metadata is requested in scan batches so one call does not retain the
+// entire waiter set in client memory.
 func (s *Semaphore) Snapshot(ctx context.Context) (Snapshot, error) {
 	if ctx == nil {
 		return Snapshot{}, invalidConfig("context must not be nil")
 	}
-	value, err := snapshotLeasesRedisScript.Run(ctx, s.redis, []string{
-		s.keys.config,
-		s.keys.holders,
-		s.keys.waiters,
-	}).Result()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("read live semaphore lease counts: %w", err)
-	}
-	values, ok := value.([]interface{})
-	if !ok || len(values) != 3 {
-		return Snapshot{}, fmt.Errorf("%w: unexpected semaphore lease snapshot result %T: %v", errInvalidSemaphoreScriptResponse, value, value)
-	}
-	nowMillis, err := scriptInt(values[0])
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("%w: parse Redis time for semaphore snapshot: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	holders, err := scriptInt(values[1])
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("%w: parse semaphore holder count: %v", errInvalidSemaphoreScriptResponse, err)
-	}
-	waiters, err := scriptInt(values[2])
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter count: %v", errInvalidSemaphoreScriptResponse, err)
-	}
+	var snapshot Snapshot
+	err := s.redis.Watch(ctx, func(tx *redis.Tx) error {
+		now, err := tx.Time(ctx).Result()
+		if err != nil {
+			return err
+		}
+		nowMillis := now.UnixMilli()
+		minimum := "(" + strconv.FormatInt(nowMillis, 10)
+		var holderCommand, waiterCommand *redis.IntCmd
+		_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			holderCommand = pipe.ZCount(ctx, s.keys.holders, minimum, "+inf")
+			waiterCommand = pipe.ZCount(ctx, s.keys.waiters, minimum, "+inf")
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		holders, err := holderCommand.Result()
+		if err != nil {
+			return err
+		}
+		waiters, err := waiterCommand.Result()
+		if err != nil {
+			return err
+		}
 
-	byQueue := make(map[string]int64, len(s.config.QueuesByPriority))
-	for _, queue := range s.config.QueuesByPriority {
-		byQueue[queue] = 0
-	}
-	if waiters == 0 {
-		return Snapshot{
+		byQueue := make(map[string]int64, len(s.config.QueuesByPriority))
+		for _, queue := range s.config.QueuesByPriority {
+			byQueue[queue] = 0
+		}
+		var oldestStarted int64
+		if waiters != 0 {
+			const snapshotBatchSize = 512
+			var cursor uint64
+			for {
+				entries, nextCursor, scanErr := tx.ZScan(ctx, s.keys.waiters, cursor, "", snapshotBatchSize).Result()
+				if scanErr != nil {
+					return scanErr
+				}
+				if len(entries)%2 != 0 {
+					return fmt.Errorf("%w: odd semaphore waiter scan entry count %d", errInvalidSemaphoreState, len(entries))
+				}
+				liveTokens := make([]string, 0, len(entries)/2)
+				for index := 0; index < len(entries); index += 2 {
+					expiry, parseErr := strconv.ParseFloat(entries[index+1], 64)
+					if parseErr != nil {
+						return fmt.Errorf("%w: invalid waiter expiry %q", errInvalidSemaphoreState, entries[index+1])
+					}
+					if expiry > float64(nowMillis) {
+						liveTokens = append(liveTokens, entries[index])
+					}
+				}
+
+				for offset := 0; offset < len(liveTokens); offset += snapshotBatchSize {
+					end := min(offset+snapshotBatchSize, len(liveTokens))
+					batch := liveTokens[offset:end]
+					var queueCommand, startedCommand *redis.SliceCmd
+					_, metadataErr := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+						queueCommand = pipe.HMGet(ctx, s.keys.tokenQueue, batch...)
+						startedCommand = pipe.HMGet(ctx, s.keys.waiterStarted, batch...)
+						return nil
+					})
+					if metadataErr != nil {
+						return metadataErr
+					}
+					queues, metadataErr := queueCommand.Result()
+					if metadataErr != nil {
+						return metadataErr
+					}
+					startedValues, metadataErr := startedCommand.Result()
+					if metadataErr != nil {
+						return metadataErr
+					}
+					for index := range batch {
+						queueText, present, parseErr := optionalRedisString(queues[index])
+						if parseErr == nil && present {
+							queueIndex, conversionErr := strconv.Atoi(queueText)
+							if conversionErr == nil && queueIndex >= 1 && queueIndex <= len(s.config.QueuesByPriority) {
+								byQueue[s.config.QueuesByPriority[queueIndex-1]]++
+							}
+						}
+						startedText, present, parseErr := optionalRedisString(startedValues[index])
+						if parseErr == nil && present {
+							started, conversionErr := strconv.ParseInt(startedText, 10, 64)
+							if conversionErr == nil && started <= nowMillis && (oldestStarted == 0 || started < oldestStarted) {
+								oldestStarted = started
+							}
+						}
+					}
+				}
+				cursor = nextCursor
+				if cursor == 0 {
+					break
+				}
+			}
+		}
+
+		var oldestWait time.Duration
+		if oldestStarted != 0 {
+			oldestWait = time.Duration(nowMillis-oldestStarted) * time.Millisecond
+		}
+		snapshot = Snapshot{
 			Holders:          holders,
 			Waiters:          waiters,
 			WaitersByQueue:   byQueue,
+			OldestWait:       oldestWait,
 			CapacityExceeded: holders > int64(s.config.Capacity),
-		}, nil
+		}
+		return nil
+	}, s.keys.config)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read semaphore snapshot from primary: %w", err)
 	}
-
-	var oldestStarted int64
-	const snapshotBatchSize = 512
-	cursor := "0"
-	for {
-		scanValue, scanErr := snapshotWaitersRedisScript.Run(ctx, s.redis, []string{
-			s.keys.config,
-			s.keys.waiters,
-		}, cursor, snapshotBatchSize).Result()
-		if scanErr != nil {
-			return Snapshot{}, fmt.Errorf("scan semaphore waiter leases: %w", scanErr)
-		}
-		scan, scanOK := scanValue.([]interface{})
-		if !scanOK || len(scan) != 2 {
-			return Snapshot{}, fmt.Errorf("%w: unexpected semaphore waiter scan result %T: %v", errInvalidSemaphoreScriptResponse, scanValue, scanValue)
-		}
-		nextCursor, cursorErr := scriptString(scan[0])
-		if cursorErr != nil {
-			return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter scan cursor: %v", errInvalidSemaphoreScriptResponse, cursorErr)
-		}
-		entries, entriesErr := scriptValues(scan[1])
-		if entriesErr != nil {
-			return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter scan entries: %v", errInvalidSemaphoreScriptResponse, entriesErr)
-		}
-		if len(entries)%2 != 0 {
-			return Snapshot{}, fmt.Errorf("%w: odd semaphore waiter scan entry count %d", errInvalidSemaphoreScriptResponse, len(entries))
-		}
-
-		liveTokens := make([]string, 0, len(entries)/2)
-		for index := 0; index < len(entries); index += 2 {
-			token, tokenErr := scriptString(entries[index])
-			if tokenErr != nil {
-				return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter token: %v", errInvalidSemaphoreScriptResponse, tokenErr)
-			}
-			expiryText, expiryErr := scriptString(entries[index+1])
-			if expiryErr != nil {
-				return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter expiry: %v", errInvalidSemaphoreScriptResponse, expiryErr)
-			}
-			expiry, expiryErr := strconv.ParseFloat(expiryText, 64)
-			if expiryErr != nil {
-				return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter expiry %q: %v", errInvalidSemaphoreScriptResponse, expiryText, expiryErr)
-			}
-			if expiry > float64(nowMillis) {
-				liveTokens = append(liveTokens, token)
-			}
-		}
-
-		for offset := 0; offset < len(liveTokens); offset += snapshotBatchSize {
-			end := min(offset+snapshotBatchSize, len(liveTokens))
-			metadataTokens := liveTokens[offset:end]
-			arguments := make([]interface{}, len(metadataTokens))
-			for index, token := range metadataTokens {
-				arguments[index] = token
-			}
-			metadataValue, metadataErr := snapshotMetadataRedisScript.Run(ctx, s.redis, []string{
-				s.keys.config,
-				s.keys.tokenQueue,
-				s.keys.waiterStarted,
-			}, arguments...).Result()
-			if metadataErr != nil {
-				return Snapshot{}, fmt.Errorf("read semaphore waiter metadata: %w", metadataErr)
-			}
-			metadata, metadataOK := metadataValue.([]interface{})
-			if !metadataOK || len(metadata) != 2 {
-				return Snapshot{}, fmt.Errorf("%w: unexpected semaphore metadata snapshot result %T: %v", errInvalidSemaphoreScriptResponse, metadataValue, metadataValue)
-			}
-			queueValues, queueErr := scriptValues(metadata[0])
-			if queueErr != nil {
-				return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter queues: %v", errInvalidSemaphoreScriptResponse, queueErr)
-			}
-			startedValues, startedErr := scriptValues(metadata[1])
-			if startedErr != nil {
-				return Snapshot{}, fmt.Errorf("%w: parse semaphore waiter start times: %v", errInvalidSemaphoreScriptResponse, startedErr)
-			}
-			for index := range metadataTokens {
-				if index < len(queueValues) && queueValues[index] != nil {
-					queueIndex, parseErr := scriptInt(queueValues[index])
-					if parseErr == nil && queueIndex >= 1 && queueIndex <= int64(len(s.config.QueuesByPriority)) {
-						byQueue[s.config.QueuesByPriority[queueIndex-1]]++
-					}
-				}
-				if index < len(startedValues) && startedValues[index] != nil {
-					started, parseErr := scriptInt(startedValues[index])
-					if parseErr == nil && started <= nowMillis && (oldestStarted == 0 || started < oldestStarted) {
-						oldestStarted = started
-					}
-				}
-			}
-		}
-
-		cursor = nextCursor
-		if cursor == "0" {
-			break
-		}
-	}
-
-	var oldestWait time.Duration
-	if oldestStarted != 0 {
-		oldestWait = time.Duration(nowMillis-oldestStarted) * time.Millisecond
-	}
-	return Snapshot{
-		Holders:          holders,
-		Waiters:          waiters,
-		WaitersByQueue:   byQueue,
-		OldestWait:       oldestWait,
-		CapacityExceeded: holders > int64(s.config.Capacity),
-	}, nil
+	return snapshot, nil
 }
 
 func withSemaphoreDefaults(config SemaphoreConfig) SemaphoreConfig {
@@ -681,10 +1012,6 @@ func validateSemaphoreConfig(client redis.UniversalClient, config SemaphoreConfi
 	}
 	if config.Capacity <= 0 {
 		return invalidConfig("capacity must be positive")
-	}
-	const maximumExactLuaInteger = uint64(1<<53 - 1)
-	if uint64(config.Capacity) > maximumExactLuaInteger {
-		return invalidConfig("capacity must not exceed %d", maximumExactLuaInteger)
 	}
 	if len(config.QueuesByPriority) == 0 || len(config.QueuesByPriority) > 64 {
 		return invalidConfig("queues by priority must contain between 1 and 64 queues")
@@ -751,331 +1078,3 @@ func randomSemaphoreToken() (string, error) {
 	}
 	return hex.EncodeToString(bytes), nil
 }
-
-func scriptInt(value interface{}) (int64, error) {
-	switch value := value.(type) {
-	case int64:
-		return value, nil
-	case int:
-		return int64(value), nil
-	case string:
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("parse Lua integer %q: %w", value, err)
-		}
-		return parsed, nil
-	case []byte:
-		parsed, err := strconv.ParseInt(string(value), 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("parse Lua integer %q: %w", value, err)
-		}
-		return parsed, nil
-	default:
-		return 0, fmt.Errorf("unexpected Lua integer %T: %v", value, value)
-	}
-}
-
-func scriptValues(value interface{}) ([]interface{}, error) {
-	switch value := value.(type) {
-	case []interface{}:
-		return value, nil
-	case []string:
-		values := make([]interface{}, len(value))
-		for index := range value {
-			values[index] = value[index]
-		}
-		return values, nil
-	default:
-		return nil, fmt.Errorf("unexpected Lua array %T: %v", value, value)
-	}
-}
-
-func scriptString(value interface{}) (string, error) {
-	switch value := value.(type) {
-	case string:
-		return value, nil
-	case []byte:
-		return string(value), nil
-	default:
-		return "", fmt.Errorf("unexpected Lua string %T: %v", value, value)
-	}
-}
-
-// Initialization is a single primary-routed write script. This avoids a
-// SETNX/GET split read when a Cluster client is configured to read replicas.
-const initializeSemaphoreScript = `
-local current = redis.call('GET', KEYS[1])
-if not current then
-  redis.call('SET', KEYS[1], ARGV[1])
-  return ARGV[1]
-end
-return current
-`
-
-// Snapshot uses write-classified EVAL commands with an explicit same-slot key
-// so Cluster clients route every diagnostic read to the slot's primary even
-// when replica reads are enabled.
-const snapshotLeasesScript = `
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local minimum = '(' .. now
-local holders = redis.call('ZCOUNT', KEYS[2], minimum, '+inf')
-local waiters = redis.call('ZCOUNT', KEYS[3], minimum, '+inf')
-return {now, holders, waiters}
-`
-
-const snapshotWaitersScript = `
-return redis.call('ZSCAN', KEYS[2], ARGV[1], 'COUNT', ARGV[2])
-`
-
-const snapshotMetadataScript = `
-return {
-  redis.call('HMGET', KEYS[2], unpack(ARGV)),
-  redis.call('HMGET', KEYS[3], unpack(ARGV))
-}
-`
-
-const tryAcquireScript = `
-local configKey = KEYS[1]
-local holdersKey = KEYS[2]
-local waitersKey = KEYS[3]
-local waiterStartedKey = KEYS[4]
-local tokenQueueKey = KEYS[5]
-local tokenRequestKey = KEYS[6]
-local activeRequestKey = KEYS[7]
-local sequenceKey = KEYS[8]
-local firstQueueKey = 9
-local queueCount = #KEYS - 8
-
-local expectedConfig = ARGV[1]
-local token = ARGV[2]
-local requestID = ARGV[3]
-local requestedQueue = tonumber(ARGV[4])
-local capacity = tonumber(ARGV[5])
-local waiterTTL = tonumber(ARGV[6])
-local permitTTL = tonumber(ARGV[7])
-local cleanupBatch = tonumber(ARGV[8])
-
-if redis.call('GET', configKey) ~= expectedConfig then
-  return {-3, 0, 0, 0, 0}
-end
-
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local prunedHolders = 0
-local prunedWaiters = 0
-local cleaned = 0
-
-local function liveCount(key)
-  return redis.call('ZCOUNT', key, '(' .. now, '+inf')
-end
-
-local function removeToken(candidate)
-  local removedHolder = redis.call('ZREM', holdersKey, candidate)
-  local removedWaiter = redis.call('ZREM', waitersKey, candidate)
-  local queueIndex = tonumber(redis.call('HGET', tokenQueueKey, candidate))
-  if queueIndex and queueIndex >= 1 and queueIndex <= queueCount then
-    redis.call('ZREM', KEYS[firstQueueKey + queueIndex - 1], candidate)
-  end
-  local candidateRequest = redis.call('HGET', tokenRequestKey, candidate)
-  if candidateRequest and redis.call('HGET', activeRequestKey, candidateRequest) == candidate then
-    redis.call('HDEL', activeRequestKey, candidateRequest)
-  end
-  redis.call('HDEL', waiterStartedKey, candidate)
-  redis.call('HDEL', tokenQueueKey, candidate)
-  redis.call('HDEL', tokenRequestKey, candidate)
-  return removedHolder, removedWaiter
-end
-
-local expiredHolders = redis.call('ZRANGEBYSCORE', holdersKey, '-inf', now, 'LIMIT', 0, cleanupBatch)
-for _, candidate in ipairs(expiredHolders) do
-  local removedHolder, removedWaiter = removeToken(candidate)
-  prunedHolders = prunedHolders + removedHolder
-  prunedWaiters = prunedWaiters + removedWaiter
-  cleaned = cleaned + 1
-end
-
-if cleaned < cleanupBatch then
-  local expiredWaiters = redis.call('ZRANGEBYSCORE', waitersKey, '-inf', now, 'LIMIT', 0, cleanupBatch - cleaned)
-  for _, candidate in ipairs(expiredWaiters) do
-    local removedHolder, removedWaiter = removeToken(candidate)
-    prunedHolders = prunedHolders + removedHolder
-    prunedWaiters = prunedWaiters + removedWaiter
-    cleaned = cleaned + 1
-  end
-end
-
-local mappedToken = redis.call('HGET', activeRequestKey, requestID)
-if mappedToken and mappedToken ~= token then
-  local holderExpiry = tonumber(redis.call('ZSCORE', holdersKey, mappedToken))
-  local waiterExpiry = tonumber(redis.call('ZSCORE', waitersKey, mappedToken))
-  if (holderExpiry and holderExpiry > now) or (waiterExpiry and waiterExpiry > now) then
-    return {-1, liveCount(holdersKey), liveCount(waitersKey), prunedHolders, prunedWaiters}
-  end
-  local removedHolder, removedWaiter = removeToken(mappedToken)
-  prunedHolders = prunedHolders + removedHolder
-  prunedWaiters = prunedWaiters + removedWaiter
-  mappedToken = false
-end
-
-local storedRequest = redis.call('HGET', tokenRequestKey, token)
-if storedRequest and storedRequest ~= requestID then
-  return {-2, liveCount(holdersKey), liveCount(waitersKey), prunedHolders, prunedWaiters}
-end
-
-local holderExpiry = tonumber(redis.call('ZSCORE', holdersKey, token))
-if holderExpiry and holderExpiry > now and storedRequest == requestID and mappedToken == token then
-  redis.call('ZADD', holdersKey, 'XX', now + permitTTL, token)
-  return {1, liveCount(holdersKey), liveCount(waitersKey), prunedHolders, prunedWaiters}
-end
-if holderExpiry then
-  local removedHolder, removedWaiter = removeToken(token)
-  prunedHolders = prunedHolders + removedHolder
-  prunedWaiters = prunedWaiters + removedWaiter
-  storedRequest = false
-  mappedToken = false
-end
-
-local waiterExpiry = tonumber(redis.call('ZSCORE', waitersKey, token))
-local storedQueue = tonumber(redis.call('HGET', tokenQueueKey, token))
-if waiterExpiry and waiterExpiry > now and storedRequest == requestID and mappedToken == token and storedQueue == requestedQueue then
-  redis.call('ZADD', waitersKey, 'XX', now + waiterTTL, token)
-else
-  if waiterExpiry or storedRequest or mappedToken == token then
-    local removedHolder, removedWaiter = removeToken(token)
-    prunedHolders = prunedHolders + removedHolder
-    prunedWaiters = prunedWaiters + removedWaiter
-  end
-  local sequence = redis.call('INCR', sequenceKey)
-  redis.call('HSET', activeRequestKey, requestID, token)
-  redis.call('HSET', tokenRequestKey, token, requestID)
-  redis.call('HSET', tokenQueueKey, token, requestedQueue)
-  redis.call('HSET', waiterStartedKey, token, now)
-  redis.call('ZADD', waitersKey, now + waiterTTL, token)
-  redis.call('ZADD', KEYS[firstQueueKey + requestedQueue - 1], sequence, token)
-end
-
-if redis.call('ZCARD', holdersKey) < capacity then
-  local selected = false
-  local cleanupBlocked = false
-  for queueIndex = 1, queueCount do
-    local queueKey = KEYS[firstQueueKey + queueIndex - 1]
-    while true do
-      local head = redis.call('ZRANGE', queueKey, 0, 0)[1]
-      if not head then
-        break
-      end
-      local expiry = tonumber(redis.call('ZSCORE', waitersKey, head))
-      if expiry and expiry > now then
-        selected = head
-        break
-      end
-      if cleaned >= cleanupBatch then
-        cleanupBlocked = true
-        break
-      end
-      local removedFromQueue = redis.call('ZREM', queueKey, head)
-      local removedHolder, removedWaiter = removeToken(head)
-      prunedHolders = prunedHolders + removedHolder
-      if removedWaiter == 0 and removedFromQueue > 0 then
-        prunedWaiters = prunedWaiters + 1
-      else
-        prunedWaiters = prunedWaiters + removedWaiter
-      end
-      cleaned = cleaned + 1
-    end
-    if selected or cleanupBlocked then
-      break
-    end
-  end
-
-  if selected == token then
-    redis.call('ZREM', waitersKey, token)
-    redis.call('ZREM', KEYS[firstQueueKey + requestedQueue - 1], token)
-    redis.call('HDEL', waiterStartedKey, token)
-    redis.call('ZADD', holdersKey, now + permitTTL, token)
-    return {1, liveCount(holdersKey), liveCount(waitersKey), prunedHolders, prunedWaiters}
-  end
-end
-
-return {0, liveCount(holdersKey), liveCount(waitersKey), prunedHolders, prunedWaiters}
-`
-
-const renewSemaphoreScript = `
-local token = ARGV[1]
-local requestID = ARGV[2]
-local permitTTL = tonumber(ARGV[3])
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-
-if redis.call('HGET', KEYS[2], token) ~= requestID then
-  return 0
-end
-if redis.call('HGET', KEYS[3], requestID) ~= token then
-  return 0
-end
-local expiry = tonumber(redis.call('ZSCORE', KEYS[1], token))
-if not expiry or expiry <= now then
-  return 0
-end
-redis.call('ZADD', KEYS[1], 'XX', now + permitTTL, token)
-return 1
-`
-
-// Cancellation is allowed to remove either a waiter or a holder because an
-// admission reply may have been lost. The token/request pair makes that safe.
-const cancelSemaphoreScript = `
-local token = ARGV[1]
-local requestID = ARGV[2]
-if redis.call('HGET', KEYS[5], token) ~= requestID then
-  return 0
-end
-
-local removed = redis.call('ZREM', KEYS[1], token)
-removed = removed + redis.call('ZREM', KEYS[2], token)
-local queueIndex = tonumber(redis.call('HGET', KEYS[4], token))
-local queueCount = #KEYS - 6
-if queueIndex and queueIndex >= 1 and queueIndex <= queueCount then
-  redis.call('ZREM', KEYS[6 + queueIndex], token)
-end
-if redis.call('HGET', KEYS[6], requestID) == token then
-  redis.call('HDEL', KEYS[6], requestID)
-end
-redis.call('HDEL', KEYS[3], token)
-redis.call('HDEL', KEYS[4], token)
-redis.call('HDEL', KEYS[5], token)
-return removed
-`
-
-// Release deliberately has its own script so its behavior can evolve
-// independently from cancellation while retaining the same token checks.
-const releaseSemaphoreScript = `
-local token = ARGV[1]
-local requestID = ARGV[2]
-if redis.call('HGET', KEYS[5], token) ~= requestID then
-  return 0
-end
-
-local clock = redis.call('TIME')
-local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-local holderExpiry = tonumber(redis.call('ZSCORE', KEYS[1], token))
-local matchedLiveHolder = 0
-if holderExpiry and holderExpiry > now and redis.call('HGET', KEYS[6], requestID) == token then
-  matchedLiveHolder = 1
-end
-
-redis.call('ZREM', KEYS[1], token)
-redis.call('ZREM', KEYS[2], token)
-local queueIndex = tonumber(redis.call('HGET', KEYS[4], token))
-local queueCount = #KEYS - 6
-if queueIndex and queueIndex >= 1 and queueIndex <= queueCount then
-  redis.call('ZREM', KEYS[6 + queueIndex], token)
-end
-if redis.call('HGET', KEYS[6], requestID) == token then
-  redis.call('HDEL', KEYS[6], requestID)
-end
-redis.call('HDEL', KEYS[3], token)
-redis.call('HDEL', KEYS[4], token)
-redis.call('HDEL', KEYS[5], token)
-return matchedLiveHolder
-`

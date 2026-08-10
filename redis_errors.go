@@ -22,12 +22,19 @@ func nilRedisClient(redisClient redis.UniversalClient) bool {
 }
 
 func isRedisServerError(err error) bool {
+	// These package-level errors also prove that the state transaction did not
+	// commit. Treat them like definitive Redis replies for ambiguity tracking.
+	if errors.Is(err, redis.TxFailedErr) ||
+		errors.Is(err, errOperationGateBusy) ||
+		errors.Is(err, errOperationGateLost) {
+		return true
+	}
 	var serverErr redis.Error
 	return errors.As(err, &serverErr)
 }
 
-// go-redis retries most of these internally, but a failover or a long-running
-// script can outlast its configured retry budget. Keep polling within the
+// go-redis retries most of these internally, but a failover or a transaction
+// can outlast its configured retry budget. Keep polling within the
 // operation's deadline instead of turning a transient Redis state into an
 // immediate failure. Other Redis replies (for example WRONGTYPE and
 // authentication errors) are deterministic and fail fast.
@@ -40,7 +47,6 @@ func isRetryableRedisServerError(err error) bool {
 		"MASTERDOWN",
 		"MOVED",
 		"NOREPLICAS",
-		"NOSCRIPT",
 		"READONLY",
 		"TRYAGAIN",
 	} {
@@ -55,9 +61,20 @@ func isRetryableRedisOperationError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if transactionOutcomeUncertain(err) {
+		return true
+	}
+	// WATCH conflicts are definitive non-commits, but remain retryable within
+	// the caller's overall operation budget even if one attempt also reached
+	// its local deadline.
+	if errors.Is(err, redis.TxFailedErr) ||
+		errors.Is(err, errOperationGateBusy) ||
+		errors.Is(err, errOperationGateLost) {
+		return true
+	}
 	if errors.Is(err, redis.ErrClosed) ||
 		errors.Is(err, redis.Nil) ||
-		errors.Is(err, errInvalidSemaphoreScriptResponse) {
+		errors.Is(err, errInvalidSemaphoreState) {
 		return false
 	}
 	if isRedisServerError(err) {

@@ -77,6 +77,61 @@ type testRedisServerError string
 func (err testRedisServerError) Error() string { return string(err) }
 func (testRedisServerError) RedisError()       {}
 
+func isTransactionPipeline(cmds []redis.Cmder) bool {
+	var multi bool
+	var exec bool
+	for _, cmd := range cmds {
+		switch strings.ToLower(cmd.Name()) {
+		case "multi":
+			multi = true
+		case "exec":
+			exec = true
+		}
+	}
+	return multi && exec
+}
+
+func pipelineTouchesKeySuffix(cmds []redis.Cmder, suffix string) bool {
+	for _, cmd := range cmds {
+		for _, arg := range cmd.Args()[1:] {
+			key, ok := arg.(string)
+			if ok && strings.HasSuffix(key, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func commandTouchesKeySuffix(cmd redis.Cmder, suffix string) bool {
+	for _, arg := range cmd.Args()[1:] {
+		key, ok := arg.(string)
+		if ok && strings.HasSuffix(key, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasStringArg(cmd redis.Cmder, want string) bool {
+	for _, arg := range cmd.Args()[1:] {
+		value, ok := arg.(string)
+		if ok && strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func isServerSideCodeCommand(cmd redis.Cmder) bool {
+	switch strings.ToLower(cmd.Name()) {
+	case "eval", "evalsha", "eval_ro", "evalsha_ro", "script", "fcall", "fcall_ro", "function":
+		return true
+	default:
+		return false
+	}
+}
+
 func (f loggerFunc) LogAttrs(ctx context.Context, level slog.Level, message string, attrs ...slog.Attr) {
 	f(ctx, level, message, attrs...)
 }
@@ -285,6 +340,285 @@ func TestSemaphoreAcquireOwnsAndReleaseRelinquishesPermit(t *testing.T) {
 	}
 }
 
+func TestSemaphoreNeverSendsServerSideCodeCommands(t *testing.T) {
+	client := newRedisClient(t, startMiniRedis(t))
+	forbiddenErr := errors.New("test guard: Redis-side code execution is forbidden")
+	var forbidden atomic.Int64
+	client.AddHook(redisCommandHook{
+		process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+			if isServerSideCodeCommand(cmd) {
+				forbidden.Add(1)
+				return fmt.Errorf("%w: %s", forbiddenErr, cmd.Name())
+			}
+			return next(ctx, cmd)
+		},
+		processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+			for _, cmd := range cmds {
+				if isServerSideCodeCommand(cmd) {
+					forbidden.Add(1)
+					return fmt.Errorf("%w: %s", forbiddenErr, cmd.Name())
+				}
+			}
+			return next(ctx, cmds)
+		},
+	})
+
+	renewed := make(chan struct{}, 1)
+	config := testSemaphoreConfig(t, 1, "default")
+	config.PermitTTL = 180 * time.Millisecond
+	config.CleanupTimeout = 50 * time.Millisecond
+	config.Logger = loggerFunc(func(_ context.Context, _ slog.Level, message string, _ ...slog.Attr) {
+		if message == "lease_renewed" {
+			select {
+			case renewed <- struct{}{}:
+			default:
+			}
+		}
+	})
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore() under server-side code guard: %v", err)
+	}
+	holder, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "ordinary-command-holder",
+	})
+	if err != nil {
+		t.Fatalf("Acquire() under server-side code guard: %v", err)
+	}
+
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	waiterResult := make(chan error, 1)
+	go func() {
+		permit, acquireErr := sem.Acquire(waitCtx, redisemaphore.AcquireRequest{
+			Queue: "default", RequestID: "ordinary-command-waiter",
+		})
+		if permit != nil {
+			waiterResult <- errors.Join(errors.New("guard waiter unexpectedly acquired"), permit.Release())
+			return
+		}
+		waiterResult <- acquireErr
+	}()
+	waitForSnapshot(t, sem, time.Second, func(snapshot redisemaphore.Snapshot) bool {
+		return snapshot.Holders == 1 && snapshot.Waiters == 1
+	})
+	select {
+	case <-renewed:
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not complete under server-side code guard")
+	}
+	cancelWait()
+	if err := receiveError(t, waiterResult, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter under server-side code guard = %v, want context.Canceled", err)
+	}
+	if err := holder.Release(); err != nil {
+		t.Fatalf("Release() under server-side code guard: %v", err)
+	}
+	if got := forbidden.Load(); got != 0 {
+		t.Fatalf("observed %d forbidden Redis-side code execution commands", got)
+	}
+}
+
+func TestSemaphoreStaleAdmissionGateReleasePreservesReplacementBeforeMaintenancePreempts(t *testing.T) {
+	addr := startMiniRedis(t)
+	client := newRedisClient(t, addr)
+	replacementClient := newRedisClient(t, addr)
+	config := testSemaphoreConfig(t, 1, "default")
+	config.AcquireTimeout = 180 * time.Millisecond
+	config.CleanupTimeout = 120 * time.Millisecond
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+	base := semaphoreBase(t, replacementClient)
+	gateKey := base + ":operation-gate"
+
+	var armed atomic.Bool
+	var blockedOnce atomic.Bool
+	transactionBlocked := make(chan struct{})
+	unblockTransactionChannel := make(chan struct{})
+	maintenanceBlocked := make(chan struct{})
+	unblockMaintenanceChannel := make(chan struct{})
+	var unblockTransactionOnce sync.Once
+	var unblockMaintenanceOnce sync.Once
+	unblockTransaction := func() { unblockTransactionOnce.Do(func() { close(unblockTransactionChannel) }) }
+	unblockMaintenance := func() { unblockMaintenanceOnce.Do(func() { close(unblockMaintenanceChannel) }) }
+	t.Cleanup(unblockTransaction)
+	t.Cleanup(unblockMaintenance)
+	var maintenanceArmed atomic.Bool
+	var maintenanceBlockedOnce atomic.Bool
+	client.AddHook(redisCommandHook{
+		process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+			if maintenanceArmed.Load() && strings.EqualFold(cmd.Name(), "set") &&
+				commandTouchesKeySuffix(cmd, ":operation-gate") && !commandHasStringArg(cmd, "nx") &&
+				maintenanceBlockedOnce.CompareAndSwap(false, true) {
+				close(maintenanceBlocked)
+				<-unblockMaintenanceChannel
+			}
+			return next(ctx, cmd)
+		},
+		processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+			if armed.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && blockedOnce.CompareAndSwap(false, true) {
+				close(transactionBlocked)
+				<-unblockTransactionChannel
+			}
+			return next(ctx, cmds)
+		},
+	})
+
+	type acquireResult struct {
+		permit *redisemaphore.Permit
+		err    error
+	}
+	result := make(chan acquireResult, 1)
+	armed.Store(true)
+	go func() {
+		permit, acquireErr := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+			Queue: "default", RequestID: "stale-gate-owner",
+		})
+		result <- acquireResult{permit: permit, err: acquireErr}
+	}()
+	select {
+	case <-transactionBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("acquisition did not reach its state transaction")
+	}
+	oldToken, err := replacementClient.Get(context.Background(), gateKey).Result()
+	if err != nil || oldToken == "" {
+		t.Fatalf("read acquired operation gate: token=%q error=%v", oldToken, err)
+	}
+	const replacementToken = "replacement-operation-gate"
+	if err := replacementClient.Set(context.Background(), gateKey, replacementToken, 2*time.Second).Err(); err != nil {
+		t.Fatalf("replace operation gate: %v", err)
+	}
+	maintenanceArmed.Store(true)
+	unblockTransaction()
+
+	select {
+	case <-maintenanceBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("acquisition cleanup did not reach its preemptive maintenance SET")
+	}
+	currentToken, err := replacementClient.Get(context.Background(), gateKey).Result()
+	if err != nil {
+		t.Fatalf("read replacement operation gate before maintenance: %v", err)
+	}
+	if currentToken != replacementToken {
+		t.Fatalf("operation gate after stale admission release = %q, want replacement %q", currentToken, replacementToken)
+	}
+	unblockMaintenance()
+
+	acquired := <-result
+	if acquired.permit != nil {
+		_ = acquired.permit.Release()
+		t.Fatal("Acquire() returned a permit after its operation gate was replaced")
+	}
+	if !errors.Is(acquired.err, redisemaphore.ErrAcquireTimeout) {
+		t.Fatalf("Acquire() with replacement gate = %v, want ErrAcquireTimeout", acquired.err)
+	}
+	if token, err := replacementClient.HGet(context.Background(), base+":active-request", "stale-gate-owner").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("active request after aborted transaction = %q, error=%v; want no partial state", token, err)
+	}
+	for _, key := range []string{base + ":holders", base + ":waiters", base + ":queue:default"} {
+		if count, err := replacementClient.ZCard(context.Background(), key).Result(); err != nil || count != 0 {
+			t.Fatalf("records in %s after aborted transaction = %d, error=%v; want 0", key, count, err)
+		}
+	}
+	armed.Store(false)
+	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "after-stale-gate",
+	}); err != nil {
+		t.Fatalf("permit lifecycle after maintenance preemption: %v", err)
+	}
+}
+
+func TestSemaphoreMaintenancePreemptsPausedAdmission(t *testing.T) {
+	client := newRedisClient(t, startMiniRedis(t))
+	config := testSemaphoreConfig(t, 1, "default")
+	config.PermitTTL = 900 * time.Millisecond
+	config.CleanupTimeout = 120 * time.Millisecond
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+
+	var armAdmission atomic.Bool
+	var blockedOnce atomic.Bool
+	admissionBlocked := make(chan struct{})
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	unblockAdmission := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(unblockAdmission)
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if armAdmission.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && blockedOnce.CompareAndSwap(false, true) {
+			close(admissionBlocked)
+			<-unblock
+		}
+		return next(ctx, cmds)
+	}})
+
+	holder, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "maintenance-holder",
+	})
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	contenderResult := make(chan error, 1)
+	armAdmission.Store(true)
+	go func() {
+		contenderResult <- acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
+			Queue: "default", RequestID: "paused-admission",
+		})
+	}()
+	select {
+	case <-admissionBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("contender did not reach its paused admission transaction")
+	}
+
+	releaseResult := make(chan error, 1)
+	go func() { releaseResult <- holder.Release() }()
+	if err := receiveError(t, releaseResult, 300*time.Millisecond); err != nil {
+		t.Fatalf("maintenance Release() while admission paused: %v", err)
+	}
+	unblockAdmission()
+	if err := receiveError(t, contenderResult, time.Second); err != nil {
+		t.Fatalf("contender after maintenance preemption: %v", err)
+	}
+	waitForSnapshot(t, sem, time.Second, func(snapshot redisemaphore.Snapshot) bool {
+		return snapshot.Holders == 0 && snapshot.Waiters == 0
+	})
+}
+
+func TestSemaphoreRecoversCommittedOperationGateWithLostResponse(t *testing.T) {
+	client := newRedisClient(t, startMiniRedis(t))
+	config := testSemaphoreConfig(t, 1, "default")
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+
+	var armed atomic.Bool
+	var injected atomic.Bool
+	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if armed.Load() && strings.EqualFold(cmd.Name(), "set") && commandTouchesKeySuffix(cmd, ":operation-gate") && injected.CompareAndSwap(false, true) {
+			if err := next(ctx, cmd); err != nil {
+				return err
+			}
+			return io.ErrUnexpectedEOF
+		}
+		return next(ctx, cmd)
+	}})
+	armed.Store(true)
+	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "ambiguous-operation-gate",
+	}); err != nil {
+		t.Fatalf("permit lifecycle after committed gate SET with lost response: %v", err)
+	}
+	if !injected.Load() {
+		t.Fatal("operation-gate fault hook did not trigger")
+	}
+}
+
 func TestPermitReleaseIsConcurrentIdempotentAndCachesResultAcrossCopies(t *testing.T) {
 	client := newRedisClient(t, startMiniRedis(t))
 	config := testSemaphoreConfig(t, 1, "default")
@@ -293,21 +627,13 @@ func TestPermitReleaseIsConcurrentIdempotentAndCachesResultAcrossCopies(t *testi
 		t.Fatalf("NewSemaphore(): %v", err)
 	}
 
-	// Prime the release script so command counting below sees one EVALSHA and
-	// does not depend on go-redis's transparent SCRIPT LOAD fallback.
-	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-		Queue: "default", RequestID: "prime",
-	}); err != nil {
-		t.Fatalf("prime permit lifecycle: %v", err)
-	}
-
 	var armed atomic.Bool
-	var releaseCommands atomic.Int64
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if armed.Load() && (cmd.Name() == "eval" || cmd.Name() == "evalsha") {
-			releaseCommands.Add(1)
+	var releaseTransactions atomic.Int64
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if armed.Load() && isTransactionPipeline(cmds) && pipelineTouchesKeySuffix(cmds, ":holders") {
+			releaseTransactions.Add(1)
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
@@ -343,8 +669,8 @@ func TestPermitReleaseIsConcurrentIdempotentAndCachesResultAcrossCopies(t *testi
 			t.Errorf("concurrent Release(): %v", err)
 		}
 	}
-	if got := releaseCommands.Load(); got != 1 {
-		t.Fatalf("Redis release commands = %d, want exactly 1", got)
+	if got := releaseTransactions.Load(); got != 1 {
+		t.Fatalf("Redis release transactions = %d, want exactly 1", got)
 	}
 	if err := permit.Release(); err != nil {
 		t.Fatalf("repeated Release(): %v", err)
@@ -352,8 +678,8 @@ func TestPermitReleaseIsConcurrentIdempotentAndCachesResultAcrossCopies(t *testi
 	if err := permitCopy.Release(); err != nil {
 		t.Fatalf("Release() through copied Permit: %v", err)
 	}
-	if got := releaseCommands.Load(); got != 1 {
-		t.Fatalf("Redis release commands after repeated Release() = %d, want cached result with 1 command", got)
+	if got := releaseTransactions.Load(); got != 1 {
+		t.Fatalf("Redis release transactions after repeated Release() = %d, want cached result with 1 transaction", got)
 	}
 	if cause := context.Cause(permit.Context()); !errors.Is(cause, context.Canceled) {
 		t.Fatalf("permit context cause after Release() = %v, want context.Canceled", cause)
@@ -378,21 +704,19 @@ func TestSemaphoreDelayedAcquireReplyIsReconfirmedBeforePermitReturns(t *testing
 	if err != nil {
 		t.Fatalf("NewSemaphore(): %v", err)
 	}
-	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-		Queue: "default", RequestID: "prime",
-	}); err != nil {
-		t.Fatalf("prime permit lifecycle: %v", err)
-	}
 
 	var armed atomic.Bool
-	var successfulCommands atomic.Int64
+	var successfulTransactions atomic.Int64
 	delayStarted := make(chan struct{})
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		err := next(ctx, cmd)
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if !isTransactionPipeline(cmds) || pipelineTouchesKeySuffix(cmds, ":operation-gate") {
+			return next(ctx, cmds)
+		}
+		err := next(ctx, cmds)
 		if err != nil {
 			return err
 		}
-		successfulCommands.Add(1)
+		successfulTransactions.Add(1)
 		if armed.CompareAndSwap(true, false) {
 			close(delayStarted)
 			time.Sleep(140 * time.Millisecond)
@@ -412,8 +736,8 @@ func TestSemaphoreDelayedAcquireReplyIsReconfirmedBeforePermitReturns(t *testing
 	default:
 		t.Fatal("acquire delay hook did not trigger")
 	}
-	if got := successfulCommands.Load(); got < 2 {
-		t.Fatalf("successful Redis commands before Permit return = %d, want at least 2 to reconfirm the delayed acquisition", got)
+	if got := successfulTransactions.Load(); got < 2 {
+		t.Fatalf("successful Redis transactions before Permit return = %d, want at least 2 to reconfirm the delayed acquisition", got)
 	}
 	if err := permit.Release(); err != nil {
 		t.Fatalf("Release(): %v", err)
@@ -431,8 +755,11 @@ func TestPermitDelayedCommittedRenewalPastSafetyCutoffLosesLease(t *testing.T) {
 	}
 	var armed atomic.Bool
 	delayStarted := make(chan struct{})
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		err := next(ctx, cmd)
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if !isTransactionPipeline(cmds) || pipelineTouchesKeySuffix(cmds, ":operation-gate") {
+			return next(ctx, cmds)
+		}
+		err := next(ctx, cmds)
 		if err != nil {
 			return err
 		}
@@ -484,15 +811,15 @@ func TestPermitBlockedPreSendRenewalTriggersLeaseWatchdog(t *testing.T) {
 	renewalBlocked := make(chan struct{})
 	unblockRenewals := make(chan struct{})
 	t.Cleanup(func() { close(unblockRenewals) })
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if blockRenewals.Load() {
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if blockRenewals.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") {
 			if observedBlock.CompareAndSwap(false, true) {
 				close(renewalBlocked)
 			}
 			// Deliberately ignore ctx to model a client stuck before sending.
 			<-unblockRenewals
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 		Queue: "default", RequestID: "blocked-renewal",
@@ -545,8 +872,8 @@ func TestPermitBlockedPreSendReleaseHonorsCleanupTimeout(t *testing.T) {
 		blockCleanup.Store(false)
 		close(unblockCleanup)
 	})
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if blockCleanup.Load() {
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if blockCleanup.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") {
 			if observedBlock.CompareAndSwap(false, true) {
 				close(cleanupBlocked)
 			}
@@ -554,7 +881,7 @@ func TestPermitBlockedPreSendReleaseHonorsCleanupTimeout(t *testing.T) {
 			// cleanup bound does not rely on the client honoring cancellation.
 			<-unblockCleanup
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 		Queue: "default", RequestID: "blocked-release",
@@ -596,11 +923,6 @@ func TestPermitDelayedCleanupReportsMissingAndPreservesReplacement(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewSemaphore(): %v", err)
 	}
-	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-		Queue: "default", RequestID: "prime-cleanup-script",
-	}); err != nil {
-		t.Fatalf("prime permit lifecycle: %v", err)
-	}
 	base := semaphoreBase(t, replacementClient)
 	var armReleaseBlock atomic.Bool
 	var releaseBlocked atomic.Bool
@@ -609,15 +931,15 @@ func TestPermitDelayedCleanupReportsMissingAndPreservesReplacement(t *testing.T)
 	var unblockOnce sync.Once
 	unblockRelease := func() { unblockOnce.Do(func() { close(unblock) }) }
 	t.Cleanup(unblockRelease)
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if armReleaseBlock.Load() && releaseBlocked.CompareAndSwap(false, true) {
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if armReleaseBlock.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && releaseBlocked.CompareAndSwap(false, true) {
 			close(blocked)
 			<-unblock
 			// Execute after the local per-attempt wait expires. The definitive
 			// missing-token response must still win over that local timeout.
-			return next(context.Background(), cmd)
+			return next(context.Background(), cmds)
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 		Queue: "default", RequestID: "late-definitive-missing",
@@ -656,20 +978,15 @@ func TestPermitDefinitiveRedisErrorDoesNotMakeMissingReleaseAmbiguous(t *testing
 	if err != nil {
 		t.Fatalf("NewSemaphore(): %v", err)
 	}
-	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-		Queue: "default", RequestID: "prime-server-error-release",
-	}); err != nil {
-		t.Fatalf("prime permit lifecycle: %v", err)
-	}
 	base := semaphoreBase(t, replacementClient)
 	var inject atomic.Bool
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if inject.CompareAndSwap(true, false) {
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if inject.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && inject.CompareAndSwap(true, false) {
 			// Redis error replies are definitive non-execution. A later missing
 			// token must not be accepted as proof this command committed.
 			return testRedisServerError("READONLY You can't write against a read only replica")
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
 		Queue: "default", RequestID: "definitive-server-error",
@@ -685,6 +1002,60 @@ func TestPermitDefinitiveRedisErrorDoesNotMakeMissingReleaseAmbiguous(t *testing
 		t.Fatalf("Release() after READONLY then missing token = %v, want ErrLeaseLost", releaseErr)
 	}
 	assertReplacementPermit(t, replacementClient, base, "definitive-server-error", replacementToken)
+}
+
+func TestPermitPreExecTransportFailureDoesNotMakeMissingReleaseAmbiguous(t *testing.T) {
+	addr := startMiniRedis(t)
+	client := newRedisClient(t, addr)
+	replacementClient := newRedisClient(t, addr)
+	config := testSemaphoreConfig(t, 1, "default")
+	config.PermitTTL = 900 * time.Millisecond
+	config.CleanupTimeout = 120 * time.Millisecond
+	sem, err := redisemaphore.NewSemaphore(client, config)
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+	base := semaphoreBase(t, replacementClient)
+
+	var inject atomic.Bool
+	blocked := make(chan struct{})
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	unblockRead := func() { unblockOnce.Do(func() { close(unblock) }) }
+	t.Cleanup(unblockRead)
+	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
+		if inject.Load() && strings.EqualFold(cmd.Name(), "get") && commandTouchesKeySuffix(cmd, ":operation-gate") && inject.CompareAndSwap(true, false) {
+			close(blocked)
+			<-unblock
+			// This fails before the watched state transaction is built, so it
+			// definitively cannot have removed the old ownership token.
+			return io.ErrUnexpectedEOF
+		}
+		return next(ctx, cmd)
+	}})
+	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "pre-exec-transport",
+	})
+	if err != nil {
+		t.Fatalf("Acquire(): %v", err)
+	}
+
+	inject.Store(true)
+	result := make(chan error, 1)
+	go func() { result <- permit.Release() }()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("Release() did not reach the pre-EXEC gate read")
+	}
+	const replacementToken = "replacement-after-pre-exec-transport"
+	installReplacementPermit(t, replacementClient, base, "pre-exec-transport", replacementToken, 2*time.Second)
+	unblockRead()
+
+	if releaseErr := receiveError(t, result, time.Second); !errors.Is(releaseErr, redisemaphore.ErrLeaseLost) {
+		t.Fatalf("Release() after pre-EXEC transport failure then missing token = %v, want ErrLeaseLost", releaseErr)
+	}
+	assertReplacementPermit(t, replacementClient, base, "pre-exec-transport", replacementToken)
 }
 
 func TestSemaphoreAcquireRejectsInvalidRequest(t *testing.T) {
@@ -807,6 +1178,82 @@ func TestSemaphoreCapacityAcrossIndependentClients(t *testing.T) {
 	}
 	if got := maximum.Load(); got != int64(config.Capacity) {
 		t.Fatalf("maximum concurrent permits = %d, want %d", got, config.Capacity)
+	}
+}
+
+func TestSemaphoreConcurrentAdmissionRenewalAndReleaseMaintenance(t *testing.T) {
+	addr := startMiniRedis(t)
+	var renewals atomic.Int64
+	config := testSemaphoreConfig(t, 3, "default")
+	config.AcquireTimeout = 5 * time.Second
+	config.PermitTTL = 180 * time.Millisecond
+	config.CleanupTimeout = 30 * time.Millisecond
+	config.Logger = loggerFunc(func(_ context.Context, _ slog.Level, message string, _ ...slog.Attr) {
+		if message == "lease_renewed" {
+			renewals.Add(1)
+		}
+	})
+
+	const clientCount = 4
+	semaphores := make([]*redisemaphore.Semaphore, clientCount)
+	for index := range semaphores {
+		sem, err := redisemaphore.NewSemaphore(newRedisClient(t, addr), config)
+		if err != nil {
+			t.Fatalf("NewSemaphore(client %d): %v", index, err)
+		}
+		semaphores[index] = sem
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	const requests = 18
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	var wg sync.WaitGroup
+	var active atomic.Int64
+	var maximum atomic.Int64
+	for index := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			permit, err := semaphores[index%clientCount].Acquire(ctx, redisemaphore.AcquireRequest{
+				Queue: "default", RequestID: fmt.Sprintf("maintenance-stress-%02d", index),
+			})
+			if err != nil {
+				results <- err
+				return
+			}
+			current := active.Add(1)
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			var workErr error
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-permit.Context().Done():
+				workErr = context.Cause(permit.Context())
+			}
+			active.Add(-1)
+			results <- errors.Join(workErr, permit.Release())
+		}(index)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Errorf("concurrent maintenance lifecycle: %v", err)
+		}
+	}
+	if got := maximum.Load(); got > int64(config.Capacity) {
+		t.Fatalf("maximum concurrent permits = %d, capacity %d", got, config.Capacity)
+	}
+	if renewals.Load() == 0 {
+		t.Fatal("maintenance stress did not exercise permit renewal")
 	}
 }
 
@@ -1113,9 +1560,9 @@ func TestSemaphoreWaiterHeartbeatAccountsForReplyLatency(t *testing.T) {
 	var delayCommands atomic.Bool
 	delayCommands.Store(true)
 	var heartbeatCommands atomic.Int64
-	waiterClient.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		err := next(ctx, cmd)
-		if err == nil && delayCommands.Load() && (cmd.Name() == "eval" || cmd.Name() == "evalsha") {
+	waiterClient.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		err := next(ctx, cmds)
+		if err == nil && delayCommands.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") {
 			heartbeatCommands.Add(1)
 			time.Sleep(140 * time.Millisecond)
 		}
@@ -1205,12 +1652,12 @@ func TestSemaphoreWaiterRedisOutageDoesNotHotSpinAfterHeartbeatDeadline(t *testi
 
 	var failWaiterCommands atomic.Bool
 	var failedCommands atomic.Int64
-	waiterClient.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if failWaiterCommands.Load() && (cmd.Name() == "eval" || cmd.Name() == "evalsha") {
+	waiterClient.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if failWaiterCommands.Load() && isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") {
 			failedCommands.Add(1)
 			return io.ErrUnexpectedEOF
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1300,6 +1747,112 @@ func TestSemaphoreRemovesStaleQueueHeadWithoutMetadata(t *testing.T) {
 	}
 }
 
+func TestSemaphoreScoreZeroMembershipIsPrunedAndCanceled(t *testing.T) {
+	assertTokenRemoved := func(t *testing.T, client redis.UniversalClient, base, queue, requestID, token string) {
+		t.Helper()
+		for _, key := range []string{base + ":holders", base + ":waiters", base + ":queue:" + queue} {
+			if score, err := client.ZScore(context.Background(), key, token).Result(); !errors.Is(err, redis.Nil) {
+				t.Fatalf("score-zero token %q remains in %s with score %v, error=%v", token, key, score, err)
+			}
+		}
+		for _, key := range []string{base + ":waiter-started", base + ":token-queue", base + ":token-request"} {
+			if value, err := client.HGet(context.Background(), key, token).Result(); !errors.Is(err, redis.Nil) {
+				t.Fatalf("score-zero token %q metadata remains in %s as %q, error=%v", token, key, value, err)
+			}
+		}
+		if value, err := client.HGet(context.Background(), base+":active-request", requestID).Result(); !errors.Is(err, redis.Nil) {
+			t.Fatalf("score-zero active request %q remains as %q, error=%v", requestID, value, err)
+		}
+	}
+
+	t.Run("prune stale waiter", func(t *testing.T) {
+		client := newRedisClient(t, startMiniRedis(t))
+		sem, err := redisemaphore.NewSemaphore(client, testSemaphoreConfig(t, 1, "default"))
+		if err != nil {
+			t.Fatalf("NewSemaphore(): %v", err)
+		}
+		base := semaphoreBase(t, client)
+		const token = "score-zero-stale-token"
+		const requestID = "score-zero-stale-request"
+		if err := client.ZAdd(context.Background(), base+":waiters", redis.Z{Score: 0, Member: token}).Err(); err != nil {
+			t.Fatalf("inject score-zero waiter: %v", err)
+		}
+		if err := client.ZAdd(context.Background(), base+":queue:default", redis.Z{Score: 0, Member: token}).Err(); err != nil {
+			t.Fatalf("inject score-zero queue member: %v", err)
+		}
+		if err := client.HSet(context.Background(), base+":waiter-started", token, 0).Err(); err != nil {
+			t.Fatalf("inject waiter start: %v", err)
+		}
+		if err := client.HSet(context.Background(), base+":token-queue", token, 1).Err(); err != nil {
+			t.Fatalf("inject token queue: %v", err)
+		}
+		if err := client.HSet(context.Background(), base+":token-request", token, requestID).Err(); err != nil {
+			t.Fatalf("inject token request: %v", err)
+		}
+		if err := client.HSet(context.Background(), base+":active-request", requestID, token).Err(); err != nil {
+			t.Fatalf("inject active request: %v", err)
+		}
+
+		if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
+			Queue: "default", RequestID: "live-after-score-zero",
+		}); err != nil {
+			t.Fatalf("permit lifecycle behind score-zero waiter: %v", err)
+		}
+		assertTokenRemoved(t, client, base, "default", requestID, token)
+	})
+
+	t.Run("cancel live waiter with zero queue score", func(t *testing.T) {
+		client := newRedisClient(t, startMiniRedis(t))
+		config := testSemaphoreConfig(t, 1, "default")
+		config.PollInitial = 200 * time.Millisecond
+		config.PollMax = 200 * time.Millisecond
+		sem, err := redisemaphore.NewSemaphore(client, config)
+		if err != nil {
+			t.Fatalf("NewSemaphore(): %v", err)
+		}
+		base := semaphoreBase(t, client)
+		holder, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+			Queue: "default", RequestID: "score-zero-holder",
+		})
+		if err != nil {
+			t.Fatalf("acquire holder: %v", err)
+		}
+
+		waitCtx, cancelWait := context.WithCancel(context.Background())
+		waiterResult := make(chan error, 1)
+		go func() {
+			permit, acquireErr := sem.Acquire(waitCtx, redisemaphore.AcquireRequest{
+				Queue: "default", RequestID: "score-zero-canceled",
+			})
+			if permit != nil {
+				waiterResult <- errors.Join(errors.New("score-zero waiter unexpectedly acquired"), permit.Release())
+				return
+			}
+			waiterResult <- acquireErr
+		}()
+		waitForSnapshot(t, sem, time.Second, func(snapshot redisemaphore.Snapshot) bool {
+			return snapshot.Holders == 1 && snapshot.Waiters == 1
+		})
+		token, err := client.HGet(context.Background(), base+":active-request", "score-zero-canceled").Result()
+		if err != nil {
+			t.Fatalf("read waiter token: %v", err)
+		}
+		if err := client.ZAddArgs(context.Background(), base+":queue:default", redis.ZAddArgs{
+			XX: true, Members: []redis.Z{{Score: 0, Member: token}},
+		}).Err(); err != nil {
+			t.Fatalf("set waiter queue score to zero: %v", err)
+		}
+		cancelWait()
+		if err := receiveError(t, waiterResult, time.Second); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled score-zero waiter = %v, want context.Canceled", err)
+		}
+		assertTokenRemoved(t, client, base, "default", "score-zero-canceled", token)
+		if err := holder.Release(); err != nil {
+			t.Fatalf("release holder: %v", err)
+		}
+	})
+}
+
 func TestSemaphoreRecoversCommittedAcquireWithLostResponse(t *testing.T) {
 	mr := startMiniRedisServer(t)
 	client := newRedisClient(t, mr.Addr())
@@ -1309,14 +1862,6 @@ func TestSemaphoreRecoversCommittedAcquireWithLostResponse(t *testing.T) {
 	sem, err := redisemaphore.NewSemaphore(client, config)
 	if err != nil {
 		t.Fatalf("NewSemaphore(): %v", err)
-	}
-
-	// Load the admission and release scripts before installing the fault hook,
-	// so the one armed command is the acquisition EVALSHA itself.
-	if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-		Queue: "default", RequestID: "prime",
-	}); err != nil {
-		t.Fatalf("prime permit lifecycle: %v", err)
 	}
 
 	configKeys, err := client.Keys(context.Background(), "redisemaphore:*:v1:semaphore:config").Result()
@@ -1332,9 +1877,9 @@ func TestSemaphoreRecoversCommittedAcquireWithLostResponse(t *testing.T) {
 	armed.Store(true)
 	var injected atomic.Bool
 	var committedToken string
-	client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-		if armed.CompareAndSwap(true, false) && injected.CompareAndSwap(false, true) {
-			if err := next(ctx, cmd); err != nil {
+	client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+		if isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && armed.CompareAndSwap(true, false) && injected.CompareAndSwap(false, true) {
+			if err := next(ctx, cmds); err != nil {
 				return err
 			}
 			committedToken = mr.HGet(activeRequestKey, "ambiguous-acquire")
@@ -1346,7 +1891,7 @@ func TestSemaphoreRecoversCommittedAcquireWithLostResponse(t *testing.T) {
 			mr.FastForward(150 * time.Millisecond)
 			return io.ErrUnexpectedEOF
 		}
-		return next(ctx, cmd)
+		return next(ctx, cmds)
 	}})
 
 	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
@@ -1387,26 +1932,18 @@ func TestSemaphoreRetriesAmbiguousReleaseWithSameToken(t *testing.T) {
 				t.Fatalf("NewSemaphore(): %v", err)
 			}
 
-			// Prime the release script so arming immediately before Release targets its
-			// EVALSHA rather than a SCRIPT LOAD fallback.
-			if err := acquireAndRelease(context.Background(), sem, redisemaphore.AcquireRequest{
-				Queue: "default", RequestID: "prime",
-			}); err != nil {
-				t.Fatalf("prime permit lifecycle: %v", err)
-			}
-
 			var armed atomic.Bool
 			var injected atomic.Bool
-			client.AddHook(redisCommandHook{process: func(ctx context.Context, cmd redis.Cmder, next redis.ProcessHook) error {
-				if armed.CompareAndSwap(true, false) && injected.CompareAndSwap(false, true) {
+			client.AddHook(redisCommandHook{processPipeline: func(ctx context.Context, cmds []redis.Cmder, next redis.ProcessPipelineHook) error {
+				if isTransactionPipeline(cmds) && !pipelineTouchesKeySuffix(cmds, ":operation-gate") && armed.CompareAndSwap(true, false) && injected.CompareAndSwap(false, true) {
 					if tt.commitFirstCall {
-						if err := next(ctx, cmd); err != nil {
+						if err := next(ctx, cmds); err != nil {
 							return err
 						}
 					}
 					return io.ErrUnexpectedEOF
 				}
-				return next(ctx, cmd)
+				return next(ctx, cmds)
 			}})
 
 			permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
@@ -1616,7 +2153,7 @@ func TestSemaphoreBlockingLoggerCannotConsumeLease(t *testing.T) {
 	defer close(unblockLogger)
 	config := testSemaphoreConfig(t, 1, "default")
 	config.PermitTTL = 180 * time.Millisecond
-	config.CleanupTimeout = 30 * time.Millisecond
+	config.CleanupTimeout = 50 * time.Millisecond
 	config.Logger = loggerFunc(func(_ context.Context, _ slog.Level, message string, attrs ...slog.Attr) {
 		if message == "acquire_success" && logAttrString(attrs, "request_id") == "holder" {
 			close(loggerEntered)
@@ -1823,6 +2360,29 @@ func TestSemaphoreAcquireTimeoutDoesNotReturnPermit(t *testing.T) {
 
 	if err := holderPermit.Release(); err != nil {
 		t.Fatalf("release holder: %v", err)
+	}
+}
+
+func TestSemaphoreAcquireRejectsDeletedConfiguration(t *testing.T) {
+	client := newRedisClient(t, startMiniRedis(t))
+	sem, err := redisemaphore.NewSemaphore(client, testSemaphoreConfig(t, 1, "default"))
+	if err != nil {
+		t.Fatalf("NewSemaphore(): %v", err)
+	}
+	base := semaphoreBase(t, client)
+	if err := client.Del(context.Background(), base+":config").Err(); err != nil {
+		t.Fatalf("delete semaphore configuration: %v", err)
+	}
+
+	permit, err := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
+		Queue: "default", RequestID: "deleted-config",
+	})
+	if permit != nil {
+		_ = permit.Release()
+		t.Fatal("Acquire() returned a permit after configuration deletion")
+	}
+	if !errors.Is(err, redisemaphore.ErrInvalidConfig) {
+		t.Fatalf("Acquire() after configuration deletion = %v, want ErrInvalidConfig", err)
 	}
 }
 

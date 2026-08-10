@@ -3,8 +3,11 @@ package redisemaphore_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,47 +140,102 @@ func TestIntegrationSemaphoreRenewsWithoutOverAdmission(t *testing.T) {
 	}
 }
 
-func TestIntegrationScriptsReloadAfterFlush(t *testing.T) {
-	if os.Getenv("REDIS_ALLOW_SCRIPT_FLUSH") != "1" {
-		t.Skip("set REDIS_ALLOW_SCRIPT_FLUSH=1 for the isolated Redis test server")
-	}
-	client := integrationRedisClient(t)
+func TestIntegrationTransactionContentionAcrossIndependentClients(t *testing.T) {
+	const (
+		capacity    = 3
+		clientCount = 6
+		workerCount = 18
+	)
 	config := redisemaphore.SemaphoreConfig{
-		Namespace:        "integration-script-flush-" + uuid.NewString(),
-		Capacity:         1,
+		Namespace:        "integration-transaction-contention-" + uuid.NewString(),
+		Capacity:         capacity,
 		QueuesByPriority: []string{"default"},
-		AcquireTimeout:   2 * time.Second,
-		PermitTTL:        600 * time.Millisecond,
-		WaiterTTL:        300 * time.Millisecond,
+		AcquireTimeout:   8 * time.Second,
+		PermitTTL:        3 * time.Second,
+		WaiterTTL:        time.Second,
 		PollInitial:      10 * time.Millisecond,
 		PollMax:          40 * time.Millisecond,
-		CleanupTimeout:   50 * time.Millisecond,
+		CleanupTimeout:   100 * time.Millisecond,
 	}
-	sem, err := redisemaphore.NewSemaphore(client, config)
-	if err != nil {
-		t.Fatalf("NewSemaphore(): %v", err)
-	}
-	acquireAndRelease := func(requestID string) error {
-		permit, acquireErr := sem.Acquire(context.Background(), redisemaphore.AcquireRequest{
-			Queue: "default", RequestID: requestID,
-		})
-		if acquireErr != nil {
-			return acquireErr
+
+	semaphores := make([]*redisemaphore.Semaphore, clientCount)
+	for index := range semaphores {
+		sem, err := redisemaphore.NewSemaphore(integrationRedisClient(t), config)
+		if err != nil {
+			t.Fatalf("NewSemaphore() for independent client %d: %v", index, err)
 		}
-		return permit.Release()
+		semaphores[index] = sem
 	}
-	if err := acquireAndRelease("before-flush"); err != nil {
-		t.Fatalf("Acquire/Release before SCRIPT FLUSH: %v", err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	capacityReached := make(chan struct{})
+	var capacityReachedOnce sync.Once
+	var active atomic.Int64
+	var maximum atomic.Int64
+	var exceeded atomic.Bool
+	results := make(chan error, workerCount)
+	var workers sync.WaitGroup
+
+	for index := 0; index < workerCount; index++ {
+		sem := semaphores[index%len(semaphores)]
+		requestID := fmt.Sprintf("contender-%02d", index)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			permit, acquireErr := sem.Acquire(ctx, redisemaphore.AcquireRequest{
+				Queue: "default", RequestID: requestID,
+			})
+			if acquireErr != nil {
+				results <- acquireErr
+				return
+			}
+
+			current := active.Add(1)
+			if current > capacity {
+				exceeded.Store(true)
+			}
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			if current == capacity {
+				capacityReachedOnce.Do(func() { close(capacityReached) })
+			}
+
+			var workErr error
+			select {
+			case <-capacityReached:
+				time.Sleep(20 * time.Millisecond)
+			case <-permit.Context().Done():
+				workErr = context.Cause(permit.Context())
+			}
+			active.Add(-1)
+			results <- errors.Join(workErr, permit.Release())
+		}()
 	}
-	if err := client.ScriptFlush(context.Background()).Err(); err != nil {
-		t.Fatalf("SCRIPT FLUSH: %v", err)
+	close(start)
+	workers.Wait()
+	close(results)
+
+	for err := range results {
+		if err != nil {
+			t.Errorf("permit lifecycle under transaction contention: %v", err)
+		}
 	}
-	if err := acquireAndRelease("after-flush"); err != nil {
-		t.Fatalf("Acquire/Release after SCRIPT FLUSH: %v", err)
+	if exceeded.Load() {
+		t.Fatalf("permits exceeded capacity %d; observed maximum %d", capacity, maximum.Load())
+	}
+	if got := maximum.Load(); got != capacity {
+		t.Fatalf("maximum concurrent permits = %d, want %d to prove contention was exercised", got, capacity)
 	}
 }
 
-func TestIntegrationReadOnlyClusterRoutesOwnershipScriptsToPrimary(t *testing.T) {
+func TestIntegrationReadOnlyClusterRoutesOwnershipTransactionsToPrimary(t *testing.T) {
 	addrs := integrationRedisAddrs(t)
 	if len(addrs) < 6 {
 		t.Skip("requires the six-node Redis Cluster integration job with replicas")

@@ -1,6 +1,6 @@
 # redisemaphore
 
-`redisemaphore` provides renewable Redis semaphore permits for Go. Admission and ownership changes are performed by bounded Lua scripts over a versioned, single-hash-slot keyspace, so every transition is atomic on one healthy Redis primary and works with Redis Cluster routing.
+`redisemaphore` provides renewable Redis semaphore permits for Go. Admission and ownership changes are computed in Go while a private, tokenized Redis operation gate is held, then committed with `WATCH` and `MULTI`/`EXEC` over a versioned, single-hash-slot keyspace. This keeps each transition atomic on one healthy Redis primary and works with Redis Cluster routing.
 
 ## Safety boundary
 
@@ -98,7 +98,7 @@ The semaphore renews each acquired permit until `Release` is called. If it canno
 
 ## Configuration and errors
 
-Zero-valued duration fields use the incident-consumer defaults: a 30-second acquisition timeout, renewable 90-second holder permit, 10-second renewable waiter lease, 100-millisecond initial poll, 1-second maximum poll, and 2-second cleanup timeout. A 90-second permit is safe for longer work only because it is renewed; it is not a maximum work duration. Every nonzero configured duration must be a positive, whole-millisecond value; `PollInitial` must not exceed `PollMax`, and lease-related durations must leave enough time for renewal and cleanup. A semaphore supports at most 64 non-empty, unique queue names.
+Zero-valued duration fields use the incident-consumer defaults: a 30-second acquisition timeout, renewable 90-second holder permit, 10-second renewable waiter lease, 100-millisecond initial poll, 1-second maximum poll, and 2-second cleanup timeout. A 90-second permit is safe for longer work only because it is renewed; it is not a maximum work duration. Every nonzero configured duration must be a positive, whole-millisecond value; `PollInitial` must not exceed `PollMax`, and lease-related durations must leave enough time for renewal and cleanup. Each transition takes several Redis round trips and may retry under contention, so configure these durations with headroom for the deployment's Redis latency rather than using the smallest values accepted by validation. A semaphore supports at most 64 non-empty, unique queue names.
 
 `AcquireTimeout` bounds polling and is checked after each Redis command returns; it does not asynchronously abandon an in-flight admission command. With go-redis's default `ContextTimeoutEnabled: false`, a stuck socket operation can therefore extend `Acquire` past `AcquireTimeout` or parent cancellation. Configure finite Redis dial, read, and write timeouts (or enable go-redis context timeouts) when wall-clock return bounds matter. Once the command returns, an expired acquisition is token-cleaned and no permit is returned; keeping cleanup ordered after the in-flight command avoids a late grant being created after cleanup already ran.
 
@@ -119,21 +119,23 @@ Acquisition returns parent-context cancellation as the corresponding `context` e
 
 Set `Logger` to any implementation of the slog-compatible `LogAttrs` method; `*slog.Logger` works directly. Logs use stable `event` attributes plus relevant namespace, queue, request, duration, count, and error fields. Event values are `acquire_start`, `acquire_success`, `acquire_failure`, `lease_renewed`, `lease_renew_error`, `lease_lost`, `release`, `cleanup`, `pruned`, and `redis_error`. Delivery is bounded and best-effort: entries may be dropped rather than delaying admission, renewal, cancellation, or cleanup. A logger may block or panic without affecting lease correctness, although it should return promptly so bounded delivery capacity remains available. Do not use request IDs as metric labels.
 
-Recommended alerts are critical on any lease loss or capacity-invariant violation and on sustained Redis script errors. Warn on at least 10 acquisition timeouts in five minutes, qualified by total attempt rate so low-volume noise does not page. Track acquisition latency, oldest waiter, waiters per queue, active work versus holders, expired leases pruned, renewal retries, and script duration.
+Recommended alerts are critical on any lease loss or capacity-invariant violation and on sustained Redis transaction errors. Warn on at least 10 acquisition timeouts in five minutes, qualified by total attempt rate so low-volume noise does not page. Track acquisition latency, oldest waiter, waiters per queue, active work versus holders, expired leases pruned, renewal retries, transaction retries, and transaction latency.
 
 ## Redis guarantees and limitations
 
-All keys for a namespace use the versioned form `redisemaphore:{escaped-namespace}:v1:*`. The hash tag keeps every key touched by one script in the same Redis Cluster slot. Lua execution makes each transition atomic on one healthy primary.
+All keys for a namespace use the versioned form `redisemaphore:{escaped-namespace}:v1:*`. The hash tag keeps the operation gate and every state key in the same Redis Cluster slot, which is required for watched transactions.
 
-A Go lock cannot replace that transaction: a process-local lock does not coordinate other clients, while an expiring distributed lock can expire between a multi-command read/check/write sequence and allow another owner to interleave. The bounded same-slot scripts keep pruning, ordering, capacity checks, and grants in one server-side transition.
+Each ownership transition acquires the private Redis operation gate with a random owner token and an expiry. While holding it, the package watches the gate and relevant state, reads Redis time and state, computes the change in Go, and commits the writes with `MULTI`/`EXEC`. Renewal, release, and cancellation replace the gate epoch so they can preempt admission; Redis command ordering means the admission transaction either commits before that replacement or aborts because its watched epoch changed. If any gate expires or is otherwise replaced before commit, its watched transaction also aborts. Token-checked gate cleanup cannot delete a replacement gate.
+
+The expiring gate is not sufficient by itself: separate read/check/write commands could otherwise outlive the gate and interleave with a new holder. Correctness comes from combining the distributed gate with the watched atomic commit. Transaction conflicts are retried within the operation deadline. A holder or waiter too close to expiry to remain live through the watched gate window is treated conservatively as lost or requeued rather than risk reviving expired ownership; under severe latency this can sacrifice availability or FIFO position to preserve safety.
 
 That atomicity guarantee is conditional on the complete package keyspace still being present and unmodified. Configuration, queue, waiter, holder, and request-mapping keys are correctness state even though many are temporary. They must not be evicted, manually deleted, have their TTLs changed, or be modified by another protocol. Set Redis `maxmemory-policy` to `noeviction` for the deployment that stores these keys; preferably use an isolated Redis instance or cluster and monitor memory headroom so unrelated workloads cannot threaten the keyspace. A separate logical database alone is not memory or eviction isolation.
 
-With those conditions, the scripts prevent the primary from granting more live permits than the stored capacity and prevent a stale token from renewing or deleting a replacement token. This is not a guarantee that no more than that many operations are physically executing: work that does not stop on cancellation can outlive its valid permit. Lease expiry also depends on sane Redis clocks, including across promoted replicas.
+With those conditions, the transaction protocol prevents the primary from granting more live permits than the stored capacity and prevents a stale token from renewing or deleting a replacement token. This is not a guarantee that no more than that many operations are physically executing: work that does not stop on cancellation can outlive its valid permit. Lease expiry also depends on sane Redis clocks, including across promoted replicas.
 
 Redis replication is asynchronous. A primary can acknowledge a lease transition that is lost during failover before it reaches a replica. RDB snapshots and the usual AOF/replication settings can likewise lose recently acknowledged state after a crash. Consequently, enabling Redis persistence does not by itself make mutual exclusion failover-safe or restart-safe.
 
-`SCRIPT FLUSH` only removes Redis's cached Lua code; the client reloads missing scripts and ownership data remains intact. A restart that reloads the exact dataset and expiration deadlines may preserve the Redis records, but the availability gap can still exhaust clients' renewal safety windows. In contrast, `FLUSHDB`, `FLUSHALL`, manual key deletion, a restart that loses state, restoring an older backup, or any other dataset rollback invalidates the coordination state. A restored dataset can omit a current owner or resurrect obsolete bookkeeping. Do not perform those destructive operations while relying on active leases. Stop admission, cancel and drain all protected work, then perform maintenance; after a rollback or restore, resume with a fresh namespace.
+A restart that reloads the exact dataset and expiration deadlines may preserve the Redis records, but the availability gap can still exhaust clients' renewal safety windows. In contrast, `FLUSHDB`, `FLUSHALL`, manual key deletion, a restart that loses state, restoring an older backup, or any other dataset rollback invalidates the coordination state. A restored dataset can omit a current owner or resurrect obsolete bookkeeping. Do not perform those destructive operations while relying on active leases. Stop admission, cancel and drain all protected work, then perform maintenance; after a rollback or restore, resume with a fresh namespace.
 
 Use a durable idempotency record or downstream fencing/version check for correctness-critical effects, including during ordinary lease loss as well as failover and recovery. Redis persistence improves availability and recovery but does not replace that application-level protection.
 
@@ -150,12 +152,6 @@ The integration tests use a real Redis server only when `REDIS_ADDR` is set. The
 
 ```shell
 REDIS_ADDR=127.0.0.1:6379 go test ./... -run Integration
-```
-
-The script-reload test calls the server-wide `SCRIPT FLUSH` command and is separately skipped unless `REDIS_ALLOW_SCRIPT_FLUSH=1`. Enable it only for an isolated test server:
-
-```shell
-REDIS_ADDR=127.0.0.1:6379 REDIS_ALLOW_SCRIPT_FLUSH=1 go test ./... -run IntegrationScriptsReload
 ```
 
 Run integration coverage against every Redis standalone and Cluster version supported by your deployment. For Cluster, set `REDIS_ADDR` to a comma-separated list of node addresses; the tests construct the same `redis.UniversalClient` shape used by the package.
